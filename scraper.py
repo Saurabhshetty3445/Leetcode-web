@@ -529,32 +529,89 @@ def content_endpoint():
             driver.quit()
 
 
-@app.route("/run", methods=["POST"])
-def run_endpoint():
-    """
-    Manual pipeline trigger.
-    Runs the full end-to-end pipeline synchronously.
-    Returns a summary JSON.
-    """
-    if not auth_check():
-        return jsonify({"error": "Unauthorized"}), 401
+import uuid
 
-    acquired = _run_lock.acquire(blocking=False)
-    if not acquired:
-        return jsonify({"status": "busy", "message": "Pipeline already running"}), 409
+# ── Pipeline run state (in-memory, sufficient for single-process Railway) ─────
+_pipeline_state: dict = {
+    "status":     "idle",   # idle | running | done | error
+    "run_id":     None,
+    "started_at": None,
+    "finished_at": None,
+    "summary":    None,
+}
 
+
+def _execute_pipeline_bg(run_id: str) -> None:
+    """Background thread target — runs the full pipeline and updates state."""
+    global _pipeline_state
     try:
         from workflow import run_pipeline
         summary = run_pipeline(
             list_fn   = run_list_cycle,
             scrape_fn = scrape_post_detail,
         )
-        return jsonify(summary), 200
+        _pipeline_state.update({
+            "status":      "done",
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "summary":     summary,
+        })
+        log.info(f"[run_id={run_id}] Pipeline finished: {summary}")
     except Exception as e:
-        log.exception(f"/run crashed: {e}")
-        return jsonify({"status": "error", "message": str(e)}), 500
+        log.exception(f"[run_id={run_id}] Pipeline crashed: {e}")
+        _pipeline_state.update({
+            "status":      "error",
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "summary":     {"error": str(e)},
+        })
     finally:
         _run_lock.release()
+
+
+@app.route("/run", methods=["POST"])
+def run_endpoint():
+    """
+    Manual pipeline trigger — fires async, returns immediately with run_id.
+    Poll /run/status to check progress.
+    Prevents overlapping runs via lock.
+    """
+    if not auth_check():
+        return jsonify({"error": "Unauthorized"}), 401
+
+    acquired = _run_lock.acquire(blocking=False)
+    if not acquired:
+        return jsonify({
+            "status":  "busy",
+            "message": "Pipeline already running",
+            "run_id":  _pipeline_state.get("run_id"),
+        }), 409
+
+    run_id = str(uuid.uuid4())[:8]
+    _pipeline_state.update({
+        "status":      "running",
+        "run_id":      run_id,
+        "started_at":  datetime.now(timezone.utc).isoformat(),
+        "finished_at": None,
+        "summary":     None,
+    })
+
+    t = threading.Thread(target=_execute_pipeline_bg, args=(run_id,), daemon=True)
+    t.start()
+
+    log.info(f"[run_id={run_id}] Pipeline started in background")
+    return jsonify({
+        "status":     "started",
+        "run_id":     run_id,
+        "message":    "Pipeline running in background. Poll /run/status for result.",
+        "status_url": "/run/status",
+    }), 202
+
+
+@app.route("/run/status", methods=["GET"])
+def run_status_endpoint():
+    """Poll this after calling /run to get pipeline progress and final summary."""
+    if not auth_check():
+        return jsonify({"error": "Unauthorized"}), 401
+    return jsonify(_pipeline_state), 200
 
 
 @app.route("/health", methods=["GET"])
