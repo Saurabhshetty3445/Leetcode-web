@@ -16,6 +16,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional
 import threading
+import uuid
 
 import requests
 from bs4 import BeautifulSoup
@@ -528,8 +529,6 @@ def content_endpoint():
         if driver:
             driver.quit()
 
-
-import uuid
 
 # ── Pipeline run state (in-memory, sufficient for single-process Railway) ─────
 _pipeline_state: dict = {
