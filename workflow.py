@@ -1,10 +1,13 @@
 """
-workflow.py — Core pipeline: list → dedupe → scrape → clean → AI → store.
+workflow.py — Core pipeline: list → dedupe → scrape → botcheck → clean → AI → describe → store.
 
 This module is the heart of the system. It is:
-  - Idempotent  : safe to re-run at any time
-  - Restart-safe: skips already-processed posts via Supabase check
-  - Self-logging : detailed stage-by-stage output
+  - Idempotent        : safe to re-run at any time
+  - Restart-safe      : skips already-processed posts via Supabase check
+  - Bot-aware         : stops cleanly if Cloudflare is detected and sends email alert
+  - Description-aware : enriches every problem with a Gemini-generated description
+  - Order-safe        : all problems from the same post are inserted sequentially,
+                        so sorting by created_at in Supabase shows company groups together
 """
 from __future__ import annotations
 
@@ -15,7 +18,9 @@ from config import MAX_RETRY, SCRAPE_DELAY
 from logger import get_logger
 from cleaner import clean_text
 from gemini_client import extract_problems
+from gemini_description import enrich_with_descriptions
 from parser import parse_gemini_output
+from botcheck import check_for_bot, BotDetectedError
 import supabase_client as db
 
 log = get_logger("workflow")
@@ -79,7 +84,12 @@ def _store_results(
     """
     Router logic:
       CASE A — no problems → insert only into post_ids
-      CASE B — problems found → insert each into problems, then post_ids
+      CASE B — problems found → insert each into problems (sequentially,
+               so they share adjacent created_at timestamps → same company
+               stays grouped when sorted), then insert post_ids
+
+    The description field on each problem dict is populated by
+    enrich_with_descriptions() before this function is called.
     """
     if _is_no_problems(problems):
         log.info(f"[CASE A] No problems — recording post_id only: {post_id}")
@@ -93,6 +103,7 @@ def _store_results(
                 company      = p.get("company", ""),
                 problem_name = p.get("problem_name", ""),
                 problem_type = p.get("problem_type", ""),
+                description  = p.get("description", ""),
                 posted_on    = timestamp,
                 post_url     = post_url,
                 problem_url  = None,
@@ -115,19 +126,21 @@ def run_pipeline(list_fn, scrape_fn) -> dict:
         scrape_fn : callable(driver, url) → str (raw post text)
 
     Returns summary dict with counts and status.
+    Stops immediately (status='bot_blocked') if Cloudflare is detected.
     """
     summary = {
-        "status":       "ok",
-        "fetched":      0,
-        "new":          0,
-        "skipped":      0,
-        "scraped_ok":   0,
-        "scraped_fail": 0,
-        "gemini_ok":    0,
-        "gemini_fail":  0,
-        "problems_total": 0,
-        "db_inserts":   0,
-        "errors":       [],
+        "status":           "ok",
+        "fetched":          0,
+        "new":              0,
+        "skipped":          0,
+        "scraped_ok":       0,
+        "scraped_fail":     0,
+        "gemini_ok":        0,
+        "gemini_fail":      0,
+        "problems_total":   0,
+        "descriptions_ok":  0,
+        "db_inserts":       0,
+        "errors":           [],
     }
 
     # ── STEP 1: fetch listing ─────────────────────────────────────────────────
@@ -170,8 +183,8 @@ def run_pipeline(list_fn, scrape_fn) -> dict:
         summary["status"] = "all_duplicate"
         return summary
 
-    # ── STEPS 3–7: per-post processing ────────────────────────────────────────
-    from scraper import build_driver, load_cookies_from_env  # import here to avoid circular
+    # ── STEPS 3–8: per-post processing ───────────────────────────────────────
+    from scraper import build_driver, load_cookies_from_env  # avoid circular import
 
     cookies = load_cookies_from_env()
     driver  = None
@@ -198,13 +211,23 @@ def run_pipeline(list_fn, scrape_fn) -> dict:
             summary["scraped_ok"] += 1
             log.info(f"Scraped {len(raw_text)} chars")
 
-            # ── STEP 4: clean ─────────────────────────────────────────────────
-            log.info("STEP 4 — Cleaning text")
+            # ── STEP 4: bot check ─────────────────────────────────────────────
+            log.info("STEP 4 — Bot check")
+            try:
+                check_for_bot(raw_text, post_url)
+            except BotDetectedError as e:
+                log.error(f"Bot detected — stopping pipeline: {e}")
+                summary["status"] = "bot_blocked"
+                summary["errors"].append(f"bot_blocked:{post_url}")
+                return summary   # hard stop — email already sent by botcheck
+
+            # ── STEP 5: clean ─────────────────────────────────────────────────
+            log.info("STEP 5 — Cleaning text")
             cleaned = clean_text(raw_text)
             log.info(f"Cleaned: {len(cleaned)} chars")
 
-            # ── STEP 5+6: Gemini extract + parse ─────────────────────────────
-            log.info("STEP 5+6 — Gemini extraction + JSON parse")
+            # ── STEP 6: Gemini extract + parse ───────────────────────────────
+            log.info("STEP 6 — Gemini extraction + JSON parse")
             problems = _gemini_with_retry(title, cleaned)
             if problems is None:
                 log.error(f"Gemini failed — skipping post: {post_id}")
@@ -215,8 +238,21 @@ def run_pipeline(list_fn, scrape_fn) -> dict:
             log.info(f"Extracted {len(problems)} problem(s)")
             summary["problems_total"] += 0 if _is_no_problems(problems) else len(problems)
 
-            # ── STEP 7: route + store ─────────────────────────────────────────
-            log.info("STEP 7 — Storing results")
+            # ── STEP 7: description enrichment ───────────────────────────────
+            if not _is_no_problems(problems):
+                log.info("STEP 7 — Generating descriptions")
+                try:
+                    problems = enrich_with_descriptions(problems)
+                    described = sum(1 for p in problems if p.get("description"))
+                    summary["descriptions_ok"] += described
+                    log.info(f"Descriptions generated: {described}/{len(problems)}")
+                except Exception as e:
+                    log.error(f"Description enrichment failed (non-fatal): {e}")
+                    for p in problems:
+                        p.setdefault("description", "")
+
+            # ── STEP 8: route + store ─────────────────────────────────────────
+            log.info("STEP 8 — Storing results")
             try:
                 _store_results(post_id, post_url, timestamp, problems)
                 summary["db_inserts"] += 1
@@ -231,12 +267,13 @@ def run_pipeline(list_fn, scrape_fn) -> dict:
             driver.quit()
             log.info("Driver closed")
 
-    # ── STEP 8: summary ───────────────────────────────────────────────────────
+    # ── Final summary ─────────────────────────────────────────────────────────
     log.info("══ PIPELINE COMPLETE ══")
     log.info(
         f"Fetched={summary['fetched']} | New={summary['new']} | "
         f"Skipped={summary['skipped']} | Scraped OK={summary['scraped_ok']} | "
         f"Gemini OK={summary['gemini_ok']} | Problems={summary['problems_total']} | "
+        f"Descriptions={summary['descriptions_ok']} | "
         f"DB inserts={summary['db_inserts']} | Errors={len(summary['errors'])}"
     )
     return summary
