@@ -36,10 +36,7 @@ _BOT_PHRASES = [
     "cf-mitigated",
 ]
 
-RAILWAY_URL = os.environ.get(
-    "RAILWAY_URL",
-    "https://leetcode-tracker-production-4d05.up.railway.app",
-)
+RAILWAY_URL = os.environ.get("RAILWAY_URL", "")
 ALERT_FROM     = os.environ.get("ALERT_EMAIL_FROM", "")
 ALERT_TO       = os.environ.get("ALERT_EMAIL_TO", "")
 ALERT_PASSWORD = os.environ.get("ALERT_EMAIL_PASSWORD", "")
