@@ -3,8 +3,8 @@ supabase_client.py — All Supabase read/write operations.
 
 Tables expected:
   post_ids  : post_id (PK), post_url, timestamp, created_at
-  problems  : id, company, problem_name, problem_type,
-              posted_on, post_url, problem_url
+  problems  : id, company, problem_name, problem_type, description,
+              posted_on, post_url, problem_url, created_at
 """
 from __future__ import annotations
 
@@ -121,17 +121,25 @@ def insert_problem(
     problem_type: str,
     posted_on:    str,
     post_url:     str,
+    description:  str = "",
     problem_url:  Optional[str] = None,
 ) -> None:
-    """Insert one extracted problem row. problem_type is normalised before insert."""
+    """
+    Insert one extracted problem row.
+    - problem_type is normalised to 'coding' | 'design' | 'none' before insert.
+    - created_at is set explicitly so rows from the same post share the same
+      timestamp, keeping company grouping intact when sorted by created_at.
+    """
     normalised_type = _normalize_problem_type(problem_type)
     payload = {
         "company":      company,
         "problem_name": problem_name,
         "problem_type": normalised_type,
+        "description":  description,
         "posted_on":    posted_on,
         "post_url":     post_url,
         "problem_url":  problem_url,
+        "created_at":   datetime.now(timezone.utc).isoformat(),
     }
     resp = requests.post(_url("problems"), headers=HEADERS, json=payload, timeout=10)
     _raise(resp, "insert_problem")
