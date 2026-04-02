@@ -84,22 +84,28 @@ def _store_results(
     """
     Router logic:
       CASE A — no problems → insert only into post_ids
-      CASE B — problems found → insert each into problems (sequentially,
-               so they share adjacent created_at timestamps → same company
-               stays grouped when sorted), then insert post_ids
+      CASE B — problems found →
+          1. Insert each into problems (sequential, preserves company ordering)
+          2. Upsert the company into companies table
+          3. Insert into company_problems (links company ↔ problem)
+          4. Insert post_id last (marks post as fully processed)
 
     The description field on each problem dict is populated by
     enrich_with_descriptions() before this function is called.
+    The DB trigger fn_sync_company_problem also handles step 2+3
+    automatically, but we call it explicitly here for reliability.
     """
     if _is_no_problems(problems):
         log.info(f"[CASE A] No problems — recording post_id only: {post_id}")
         db.insert_post_id(post_id, post_url, timestamp)
         return
 
-    log.info(f"[CASE B] {len(problems)} problem(s) found — inserting to problems table")
+    log.info(f"[CASE B] {len(problems)} problem(s) found — inserting to problems + company_problems")
+    inserted_problems: list[tuple] = []   # (problem_id, problem_dict)
+
     for p in problems:
         try:
-            db.insert_problem(
+            problem_id = db.insert_problem_returning_id(
                 company      = p.get("company", ""),
                 problem_name = p.get("problem_name", ""),
                 problem_type = p.get("problem_type", ""),
@@ -108,8 +114,32 @@ def _store_results(
                 post_url     = post_url,
                 problem_url  = None,
             )
+            if problem_id:
+                inserted_problems.append((problem_id, p))
         except Exception as e:
             log.error(f"Failed to insert problem {p}: {e}")
+
+    # For each successfully inserted problem, sync to company_problems
+    for problem_id, p in inserted_problems:
+        company_name = p.get("company", "").strip()
+        if not company_name:
+            continue
+        try:
+            company_id = db.upsert_company(company_name)
+            if company_id:
+                db.insert_company_problem(
+                    company_id   = company_id,
+                    problem_id   = problem_id,
+                    company_name = company_name,
+                    problem_name = p.get("problem_name", ""),
+                    problem_type = p.get("problem_type", ""),
+                    description  = p.get("description", ""),
+                    posted_on    = timestamp,
+                    post_url     = post_url,
+                    problem_url  = None,
+                )
+        except Exception as e:
+            log.error(f"Failed to sync company_problems for {p.get('problem_name')!r}: {e}")
 
     # Only record post_id AFTER all problems are safely stored
     db.insert_post_id(post_id, post_url, timestamp)
