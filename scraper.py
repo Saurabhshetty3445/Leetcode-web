@@ -459,11 +459,16 @@ def run_list_cycle() -> list:
         )
         combined = combined[:MAX_POSTS_COMBINED]
 
+        from email.utils import formatdate as _rfc_fmt
         for post in combined:
+            # Convert relative string (e.g. "2 hours ago") to absolute
+            # RFC 2822 format (e.g. "Wed, 02 Apr 2026 07:30:00 GMT")
+            epoch = timestamp_to_sort_key(post["timestamp"])
+            abs_ts = _rfc_fmt(epoch, usegmt=True) if epoch else _rfc_fmt(usegmt=True)
             posts.append({
                 "post_id":   post_hash(post["url"]),
                 "title":     post["title"],
-                "timestamp": post["timestamp"],
+                "timestamp": abs_ts,
                 "post_url":  post["url"],
             })
 
