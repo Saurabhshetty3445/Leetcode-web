@@ -19,6 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxrandr2 \
     libxss1 \
     libgbm1 \
+    libxkbcommon0 \
     xdg-utils \
     && rm -rf /var/lib/apt/lists/*
 
