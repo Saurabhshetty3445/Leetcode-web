@@ -1,13 +1,18 @@
 # ===============================
-# BASE IMAGE (REQUIRED)
+# BASE IMAGE
 # ===============================
 FROM python:3.11-slim
+
+# ===============================
+# ENV (avoid prompts)
+# ===============================
+ENV DEBIAN_FRONTEND=noninteractive
 
 # ===============================
 # SYSTEM DEPENDENCIES
 # ===============================
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    wget gnupg curl unzip ca-certificates \
+    wget gnupg curl unzip ca-certificates procps \
     fonts-liberation libappindicator3-1 libasound2 libatk-bridge2.0-0 \
     libatk1.0-0 libcups2 libdbus-1-3 libgdk-pixbuf-xlib-2.0-0 \
     libnspr4 libnss3 libx11-xcb1 libxcomposite1 libxdamage1 libxrandr2 \
@@ -15,7 +20,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # ===============================
-# INSTALL GOOGLE CHROME
+# INSTALL GOOGLE CHROME (PINNED VERSION)
 # ===============================
 RUN mkdir -p /etc/apt/keyrings \
     && curl -fsSL https://dl.google.com/linux/linux_signing_key.pub \
@@ -23,13 +28,13 @@ RUN mkdir -p /etc/apt/keyrings \
     && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" \
        > /etc/apt/sources.list.d/google-chrome.list \
     && apt-get update \
-    && apt-get install -y google-chrome-stable \
+    && apt-get install -y google-chrome-stable=123.0.6312.122-1 \
     && rm -rf /var/lib/apt/lists/*
 
 # ===============================
 # INSTALL MATCHING CHROMEDRIVER
 # ===============================
-RUN CHROME_VERSION=$(google-chrome-stable --version | grep -oP '\d+\.\d+\.\d+') && \
+RUN CHROME_VERSION=$(google-chrome --version | grep -oP '\d+\.\d+\.\d+') && \
     echo "Chrome version: $CHROME_VERSION" && \
     DRIVER_VERSION=$(curl -s https://googlechromelabs.github.io/chrome-for-testing/LATEST_RELEASE_$CHROME_VERSION) && \
     echo "Driver version: $DRIVER_VERSION" && \
@@ -41,6 +46,11 @@ RUN CHROME_VERSION=$(google-chrome-stable --version | grep -oP '\d+\.\d+\.\d+') 
     rm -rf /tmp/chromedriver*
 
 # ===============================
+# PREVENT SELENIUM MANAGER (IMPORTANT)
+# ===============================
+ENV SELENIUM_MANAGER_DISABLE=true
+
+# ===============================
 # APP SETUP
 # ===============================
 WORKDIR /app
@@ -49,6 +59,12 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
+
+# ===============================
+# CLEANUP SCRIPT (optional but powerful)
+# ===============================
+RUN echo '#!/bin/sh\npkill -f chrome || true\npkill -f chromedriver || true' > /usr/local/bin/cleanup.sh \
+    && chmod +x /usr/local/bin/cleanup.sh
 
 # ===============================
 # RUN APP
