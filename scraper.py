@@ -45,21 +45,42 @@ _run_lock = threading.Lock()
 
 # ── Selenium Driver (UNCHANGED) ───────────────────────────────────────────────
 
+# ── Chrome / Chromedriver paths ──────────────────────────────────────────────
+# Read from env vars set in Dockerfile; fall back to common locations.
+_CHROME_BIN = (
+    os.environ.get("CHROME_BIN")
+    or "/opt/chrome/chrome"
+    or "/usr/local/bin/google-chrome"
+)
+_DRIVER_BIN = (
+    os.environ.get("CHROMEDRIVER_BIN")
+    or "/opt/chromedriver/chromedriver"
+    or "/usr/local/bin/chromedriver"
+)
+
+
 def build_driver(cookies: Optional[list] = None) -> webdriver.Chrome:
+    from selenium.webdriver.chrome.service import Service as ChromeService
+
     opts = Options()
+
+    # ── Headless + sandbox ────────────────────────────────────────────────────
     opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_argument("--disable-gpu")
+    opts.add_argument("--disable-software-rasterizer")
+
+    # ── Performance / stealth ─────────────────────────────────────────────────
     opts.add_argument("--window-size=1280,720")
     opts.add_argument("--blink-settings=imagesEnabled=false")
     opts.add_argument("--disable-extensions")
-    opts.add_argument("--disable-gpu")
-    opts.add_argument("--disable-software-rasterizer")
+    opts.add_argument("--disable-background-networking")
     opts.add_argument("--no-first-run")
     opts.add_argument("--disable-default-apps")
-    opts.add_argument("--disable-background-networking")
-    opts.page_load_strategy = "eager"
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_argument("--disable-infobars")
+    opts.add_argument("--remote-debugging-port=0")  # avoids port conflicts
     opts.add_argument(
         "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -68,14 +89,14 @@ def build_driver(cookies: Optional[list] = None) -> webdriver.Chrome:
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
     opts.add_experimental_option("useAutomationExtension", False)
     opts.set_capability("pageLoadStrategy", "eager")
-    opts.binary_location = "/usr/bin/google-chrome-stable"
 
-    from selenium.webdriver.chrome.service import Service as ChromeService
-    service = ChromeService(executable_path="/usr/bin/chromedriver")
-    try:
-        driver = webdriver.Chrome(service=service, options=opts)
-    except Exception:
-        driver = webdriver.Chrome(options=opts)
+    # ── Explicit binary paths from Dockerfile env vars ────────────────────────
+    opts.binary_location = _CHROME_BIN
+    log.info(f"Chrome binary : {_CHROME_BIN}")
+    log.info(f"Chromedriver  : {_DRIVER_BIN}")
+
+    service = ChromeService(executable_path=_DRIVER_BIN)
+    driver  = webdriver.Chrome(service=service, options=opts)
 
     driver.set_page_load_timeout(25)
     driver.execute_cdp_cmd(
@@ -361,7 +382,7 @@ def scrape_listing(driver: webdriver.Chrome, url: str, max_posts: int = 6) -> li
 
         if not any(kw in title.lower() for kw in [
             "interview", "experience", "sde", "questions", "question",
-            "swe", "rejected", "accepted", "reject", "accept", "l5","selected","select","oa"
+            "swe", "rejected", "accepted", "reject", "accept", "oa"
         ]):
             log.info(f"Skipping — no keyword match: {title!r}")
             continue
