@@ -47,42 +47,53 @@ _run_lock = threading.Lock()
 
 def build_driver(cookies: Optional[list] = None) -> webdriver.Chrome:
     opts = Options()
+
+    # 🔥 STABILITY FLAGS (critical for container)
     opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--disable-blink-features=AutomationControlled")
-    opts.add_argument("--window-size=1280,720")
-    opts.add_argument("--blink-settings=imagesEnabled=false")
-    opts.add_argument("--disable-extensions")
     opts.add_argument("--disable-gpu")
+    opts.add_argument("--disable-extensions")
     opts.add_argument("--disable-software-rasterizer")
+    opts.add_argument("--disable-background-networking")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
     opts.add_argument("--no-first-run")
     opts.add_argument("--disable-default-apps")
-    opts.add_argument("--disable-background-networking")
+    opts.add_argument("--window-size=1280,720")
+    opts.add_argument("--single-process")  # 🔥 important for low RAM
+
     opts.page_load_strategy = "eager"
+
+    # ✅ user agent
     opts.add_argument(
         "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     )
+
+    # ✅ disable automation detection
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
     opts.add_experimental_option("useAutomationExtension", False)
-    opts.set_capability("pageLoadStrategy", "eager")
-    opts.binary_location = "/usr/bin/google-chrome-stable"
 
+    # ✅ force binary path (from Docker)
+    opts.binary_location = "/usr/bin/google-chrome"
+
+    # 🔥 FORCE MANUAL DRIVER (NO Selenium Manager)
     from selenium.webdriver.chrome.service import Service as ChromeService
     service = ChromeService(executable_path="/usr/bin/chromedriver")
-    try:
-        driver = webdriver.Chrome(service=service, options=opts)
-    except Exception:
-        driver = webdriver.Chrome(options=opts)
+
+    # ✅ NO fallback → fail fast if broken
+    driver = webdriver.Chrome(service=service, options=opts)
 
     driver.set_page_load_timeout(25)
+
+    # anti-detection
     driver.execute_cdp_cmd(
         "Page.addScriptToEvaluateOnNewDocument",
         {"source": "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"},
     )
 
+    # 🍪 cookies
     if cookies:
         driver.get("https://leetcode.com")
         time.sleep(0.5)
