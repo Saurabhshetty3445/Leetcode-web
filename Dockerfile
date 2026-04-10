@@ -28,9 +28,8 @@ RUN mkdir -p /etc/apt/keyrings \
     && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" \
        > /etc/apt/sources.list.d/google-chrome.list \
     && apt-get update \
-    && apt-get install -y google-chrome-stable=123.0.6312.122-1 \
+    && apt-get install -y google-chrome-stable \
     && rm -rf /var/lib/apt/lists/*
-
 # ===============================
 # INSTALL MATCHING CHROMEDRIVER
 # ===============================
