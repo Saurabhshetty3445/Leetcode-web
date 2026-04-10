@@ -1,4 +1,5 @@
-FROM python:3.11-slim
+# Pin to Bookworm (Debian 12) — stable package names, no Trixie renames
+FROM python:3.11-slim-bookworm
 
 # ── System dependencies ───────────────────────────────────────────────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -21,9 +22,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     xdg-utils \
     && rm -rf /var/lib/apt/lists/*
 
-# ── Install Chrome for Testing (pinned stable) ────────────────────────────────
-# Uses the official chrome-for-testing JSON API — no apt-key, no stale CDN.
-# Both chrome and chromedriver are downloaded as a matched pair.
+# ── Install Chrome for Testing (matched stable pair) ─────────────────────────
+# Fetches both chrome + chromedriver at the exact same version via the
+# official JSON API — no apt-key, no stale CDN, always in sync.
 RUN set -ex \
     && CHROME_JSON=$(curl -sSf \
         "https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json") \
@@ -40,13 +41,13 @@ RUN set -ex \
     \
     && curl -sSL "$CHROME_URL"  -o /tmp/chrome.zip \
     && unzip -q /tmp/chrome.zip  -d /opt/ \
-    && mv /opt/chrome-linux64  /opt/chrome \
-    && ln -sf /opt/chrome/chrome  /usr/local/bin/google-chrome \
+    && mv /opt/chrome-linux64   /opt/chrome \
+    && ln -sf /opt/chrome/chrome /usr/local/bin/google-chrome \
     && chmod +x /opt/chrome/chrome \
     \
     && curl -sSL "$DRIVER_URL" -o /tmp/chromedriver.zip \
     && unzip -q /tmp/chromedriver.zip -d /opt/ \
-    && mv /opt/chromedriver-linux64 /opt/chromedriver \
+    && mv /opt/chromedriver-linux64    /opt/chromedriver \
     && ln -sf /opt/chromedriver/chromedriver /usr/local/bin/chromedriver \
     && chmod +x /opt/chromedriver/chromedriver \
     \
