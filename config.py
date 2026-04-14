@@ -14,12 +14,6 @@ GEMINI_MODEL   = "gemini-2.5-flash"
 # ── Scraper auth ──────────────────────────────────────────────────────────────
 SCRAPER_API_KEY = os.environ.get("SCRAPER_API_KEY", "")
 
-# ── Bot-check email alert ─────────────────────────────────────────────────────
-ALERT_EMAIL_FROM     = os.environ.get("ALERT_EMAIL_FROM", "")
-ALERT_EMAIL_TO       = os.environ.get("ALERT_EMAIL_TO", "")
-ALERT_EMAIL_PASSWORD = os.environ.get("ALERT_EMAIL_PASSWORD", "")
-RAILWAY_URL          = os.environ.get("RAILWAY_URL", "")
-
 # ── LeetCode targets ──────────────────────────────────────────────────────────
 LEETCODE_URL_1    = "https://leetcode.com/discuss/topic/interview-experience/"
 LEETCODE_URL_2    = "https://leetcode.com/discuss/topic/interview/"
