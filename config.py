@@ -9,7 +9,7 @@ SUPABASE_KEY  = os.environ.get("SUPABASE_KEY", "")
 
 # ── Gemini ────────────────────────────────────────────────────────────────────
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL   = "gemini-2,5-flash"
+GEMINI_MODEL   = "gemini-2.5-flash"
 
 # ── Scraper auth ──────────────────────────────────────────────────────────────
 SCRAPER_API_KEY = os.environ.get("SCRAPER_API_KEY", "")
