@@ -21,10 +21,31 @@ REQUIRED_KEYS = {"problem_name", "problem_type", "company"}
 
 
 def _strip_markdown(text: str) -> str:
-    """Remove ```json ... ``` fences if present."""
+    """
+    Remove any markdown fences or stray backtick sequences Gemini appends.
+    Handles all observed variants:
+      - ```json ... ```   full fenced block
+      - ```               opening fence only
+      - ``                double backtick suffix (seen in logs)
+      - `                 single stray backtick
+    Final step: extract only the content between the first [ and last ]
+    so any trailing garbage after the JSON array is discarded entirely.
+    """
     text = text.strip()
-    text = re.sub(r"^```(?:json)?\s*", "", text)
-    text = re.sub(r"\s*```$", "", text)
+
+    # Remove opening fence: ```json or ``` or `` or `
+    text = re.sub(r"^`{1,3}(?:json)?\s*", "", text)
+
+    # Remove any closing backtick sequence (1, 2, or 3 backticks)
+    text = re.sub(r"\s*`{1,3}\s*$", "", text)
+
+    # Extract exactly the JSON array — everything from first [ to last ]
+    # This discards any stray text before or after the array
+    start = text.find("[")
+    end   = text.rfind("]")
+    if start != -1 and end != -1 and end > start:
+        text = text[start:end + 1]
+
     return text.strip()
 
 
