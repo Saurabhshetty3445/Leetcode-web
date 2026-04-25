@@ -62,6 +62,17 @@ def build_driver(cookies: Optional[list] = None) -> webdriver.Chrome:
     opts.add_argument("--window-size=1280,720")
     opts.add_argument("--single-process")  # 🔥 important for low RAM
 
+    # 🔥 OOM PREVENTION — stops Chrome being killed by Railway OS
+    opts.add_argument("--disable-dev-shm-usage")          # already set, belt+suspenders
+    opts.add_argument("--shm-size=128m")                   # cap shared memory usage
+    opts.add_argument("--memory-pressure-off")             # disable memory pressure signals
+    opts.add_argument("--disable-renderer-backgrounding")  # prevent background tab GC pressure
+    opts.add_argument("--disable-backgrounding-occluded-windows")
+    opts.add_argument("--disable-features=TranslateUI,BlinkGenPropertyTrees")
+    opts.add_argument("--blink-settings=imagesEnabled=false")  # skip image decode memory
+    opts.add_argument("--renderer-process-limit=1")        # only 1 renderer process
+    opts.add_argument("--js-flags=--max-old-space-size=256")  # cap V8 heap to 256 MB
+
     opts.page_load_strategy = "eager"
 
     # ✅ user agent
