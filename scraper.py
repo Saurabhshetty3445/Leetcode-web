@@ -45,7 +45,30 @@ _run_lock = threading.Lock()
 
 # ── Selenium Driver (UNCHANGED) ───────────────────────────────────────────────
 
+def _kill_zombie_chrome() -> None:
+    """
+    Kill any leftover Chrome/chromedriver processes before spawning a new one.
+    Prevents [Errno 11] BlockingIOError caused by exhausted OS process/FD limits
+    when the scheduler spawns Chrome repeatedly across 4-hour cron cycles.
+    """
+    import subprocess as _sp
+    for proc_name in ("chrome", "chromedriver", "google-chrome"):
+        try:
+            _sp.run(
+                ["pkill", "-f", proc_name],
+                stdout=_sp.DEVNULL,
+                stderr=_sp.DEVNULL,
+                timeout=5,
+            )
+        except Exception:
+            pass
+    time.sleep(1)   # give OS time to reclaim FDs
+
+
 def build_driver(cookies: Optional[list] = None) -> webdriver.Chrome:
+    # Kill zombie Chrome processes first — prevents [Errno 11] FD exhaustion
+    _kill_zombie_chrome()
+
     opts = Options()
 
     # 🔥 STABILITY FLAGS (critical for container)
@@ -60,18 +83,16 @@ def build_driver(cookies: Optional[list] = None) -> webdriver.Chrome:
     opts.add_argument("--no-first-run")
     opts.add_argument("--disable-default-apps")
     opts.add_argument("--window-size=1280,720")
-    opts.add_argument("--single-process")  # 🔥 important for low RAM
+    opts.add_argument("--single-process")   # 🔥 important for low RAM
+    opts.add_argument("--no-zygote")        # 🔥 prevents zygote holding extra FDs
 
-    # 🔥 OOM PREVENTION — stops Chrome being killed by Railway OS
-    opts.add_argument("--disable-dev-shm-usage")          # already set, belt+suspenders
-    opts.add_argument("--shm-size=128m")                   # cap shared memory usage
-    opts.add_argument("--memory-pressure-off")             # disable memory pressure signals
-    opts.add_argument("--disable-renderer-backgrounding")  # prevent background tab GC pressure
+    # 🔥 OOM / FD PREVENTION
+    opts.add_argument("--memory-pressure-off")
+    opts.add_argument("--disable-renderer-backgrounding")
     opts.add_argument("--disable-backgrounding-occluded-windows")
     opts.add_argument("--disable-features=TranslateUI,BlinkGenPropertyTrees")
-    opts.add_argument("--blink-settings=imagesEnabled=false")  # skip image decode memory
-    opts.add_argument("--renderer-process-limit=1")        # only 1 renderer process
-    opts.add_argument("--js-flags=--max-old-space-size=256")  # cap V8 heap to 256 MB
+    opts.add_argument("--blink-settings=imagesEnabled=false")
+    opts.add_argument("--renderer-process-limit=1")
 
     opts.page_load_strategy = "eager"
 
@@ -507,6 +528,65 @@ def run_list_cycle() -> list:
 
 
 # ── Flask auth ────────────────────────────────────────────────────────────────
+
+# ── Railway auto-redeploy (one-shot) ─────────────────────────────────────────
+# Called when [Errno 11] / Chrome cannot start after all retries.
+# A flag file ensures it fires ONLY ONCE per container lifetime — never loops.
+# After redeploy, the new container has a clean FD/process table.
+#
+# Required Railway env vars:
+#   RAILWAY_API_TOKEN  — from Railway dashboard → Account → Tokens
+#   RAILWAY_SERVICE_ID — from Railway dashboard → Service → Settings
+
+_REDEPLOY_FLAG = "/tmp/.railway_redeploy_triggered"
+
+
+def trigger_railway_redeploy() -> bool:
+    """
+    Trigger one Railway redeploy via the Railway GraphQL API.
+    Returns True if the call succeeded, False otherwise.
+    Will never fire more than once per container lifetime.
+    """
+    if os.path.exists(_REDEPLOY_FLAG):
+        log.info("Auto-redeploy already triggered this session — skipping")
+        return False
+
+    api_token  = os.environ.get("RAILWAY_API_TOKEN", "")
+    service_id = os.environ.get("RAILWAY_SERVICE_ID", "")
+
+    if not api_token or not service_id:
+        log.warning(
+            "Auto-redeploy skipped: RAILWAY_API_TOKEN or RAILWAY_SERVICE_ID not set. "
+            "Add these to Railway env vars to enable auto-recovery."
+        )
+        return False
+
+    query = """
+    mutation serviceInstanceRedeploy($serviceId: String!) {
+      serviceInstanceRedeploy(serviceId: $serviceId)
+    }
+    """
+    try:
+        resp = requests.post(
+            "https://backboard.railway.com/graphql/v2",
+            headers={
+                "Authorization": f"Bearer {api_token}",
+                "Content-Type":  "application/json",
+            },
+            json={"query": query, "variables": {"serviceId": service_id}},
+            timeout=15,
+        )
+        if resp.ok:
+            open(_REDEPLOY_FLAG, "w").write("1")   # set one-shot flag
+            log.info(f"🔄 Railway auto-redeploy triggered (service={service_id})")
+            return True
+        else:
+            log.error(f"Railway redeploy API [{resp.status_code}]: {resp.text[:200]}")
+            return False
+    except Exception as e:
+        log.error(f"Railway redeploy request failed: {e}")
+        return False
+
 
 def auth_check() -> bool:
     api_key  = request.headers.get("X-API-Key", "")
