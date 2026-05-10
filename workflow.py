@@ -26,20 +26,58 @@ log = get_logger("workflow")
 
 # ── Retry helpers ─────────────────────────────────────────────────────────────
 
-def _scrape_with_retry(driver, url: str, scrape_fn) -> Optional[str]:
-    """Call scrape_fn(driver, url) with up to MAX_RETRY retries."""
+# Signals that mean the Chrome renderer/process is dead and must be rebuilt
+_RENDERER_CRASH_SIGNALS = [
+    "timed out receiving message from renderer",
+    "session not created",
+    "chrome not reachable",
+    "no such session",
+    "invalid session id",
+    "target window already closed",
+    "errno 11",
+    "resource temporarily unavailable",
+    "blockingioerror",
+]
+
+
+def _is_renderer_crash(error: Exception) -> bool:
+    msg = str(error).lower()
+    return any(sig in msg for sig in _RENDERER_CRASH_SIGNALS)
+
+
+def _scrape_with_retry(driver, url: str, scrape_fn, cookies=None):
+    """
+    Call scrape_fn(driver, url) with up to MAX_RETRY retries.
+    On renderer crash: kill dead driver, rebuild fresh, retry once.
+    Returns (result, driver) — caller must reassign driver from return value.
+    """
+    from scraper import build_driver
+
     for attempt in range(1, MAX_RETRY + 2):
         try:
             result = scrape_fn(driver, url)
             if result:
-                return result
+                return result, driver
             log.warning(f"Scrape returned empty (attempt {attempt}): {url}")
         except Exception as e:
-            log.warning(f"Scrape error attempt {attempt}: {e}")
+            if _is_renderer_crash(e):
+                log.error(f"Renderer/process crash (attempt {attempt}): {e}")
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+                try:
+                    driver = build_driver(cookies)
+                    log.info("Driver rebuilt after crash")
+                except Exception as build_err:
+                    log.error(f"Driver rebuild failed: {build_err}")
+                    return None, driver
+            else:
+                log.warning(f"Scrape error attempt {attempt}: {e}")
         if attempt <= MAX_RETRY:
             time.sleep(2)
     log.error(f"Scrape failed after all retries: {url}")
-    return None
+    return None, driver
 
 
 def _gemini_with_retry(title: str, content: str) -> Optional[list[dict]]:
@@ -178,6 +216,16 @@ def run_pipeline(list_fn, scrape_fn) -> dict:
         log.exception(f"list_fn crashed: {e}")
         summary["status"]  = "error"
         summary["errors"].append(str(e))
+        # [Errno 11] means OS process/FD limit exhausted — trigger one redeploy
+        # to get a fresh container with a clean process table.
+        err_msg = str(e).lower()
+        if "errno 11" in err_msg or "resource temporarily unavailable" in err_msg or "blockingioerror" in err_msg:
+            log.error("OS resource exhaustion detected — triggering Railway auto-redeploy")
+            try:
+                from scraper import trigger_railway_redeploy
+                trigger_railway_redeploy()
+            except Exception as rd_err:
+                log.error(f"Redeploy call failed: {rd_err}")
         return summary
 
     summary["fetched"] = len(posts)
@@ -229,11 +277,19 @@ def run_pipeline(list_fn, scrape_fn) -> dict:
 
             # ── STEP 3: scrape ────────────────────────────────────────────────
             log.info(f"STEP 3 — Scraping: {post_url}")
-            raw_text = _scrape_with_retry(driver, post_url, scrape_fn)
+            raw_text, driver = _scrape_with_retry(driver, post_url, scrape_fn, cookies)
             if not raw_text:
                 log.error(f"Scrape failed — skipping post: {post_id}")
                 summary["scraped_fail"] += 1
                 summary["errors"].append(f"scrape_fail:{post_id}")
+                # If all scrapes fail, trigger redeploy so next run gets fresh Chrome
+                if summary["scraped_ok"] == 0 and i == len(new_posts):
+                    log.error("All scrapes failed — triggering Railway auto-redeploy")
+                    try:
+                        from scraper import trigger_railway_redeploy
+                        trigger_railway_redeploy()
+                    except Exception as rd_err:
+                        log.error(f"Redeploy call failed: {rd_err}")
                 continue
             summary["scraped_ok"] += 1
             log.info(f"Scraped {len(raw_text)} chars")
