@@ -274,26 +274,6 @@ def upsert_company(company_name: str) -> Optional[str]:
     return None
 
 
-def _company_problem_payload(
-    company_id: str, problem_id: str, company_name: str,
-    problem_name: str, problem_type: str, description: str,
-    posted_on: str, post_url: str,
-    problem_url: Optional[str], created_at: Optional[str],
-) -> dict:
-    return {
-        "company_id":   company_id,
-        "problem_id":   problem_id,
-        "company_name": company_name,
-        "problem_name": problem_name,
-        "problem_type": _normalize_problem_type(problem_type),
-        "description":  description,
-        "posted_on":    posted_on,
-        "post_url":     post_url,
-        "problem_url":  problem_url,
-        "created_at":   created_at or datetime.now(timezone.utc).isoformat(),
-    }
-
-
 def insert_company_problem(
     company_id:   str,
     problem_id:   str,
@@ -306,11 +286,22 @@ def insert_company_problem(
     problem_url:  Optional[str] = None,
     created_at:   Optional[str] = None,
 ) -> None:
-    """Insert one row into company_problems (fire-and-forget)."""
-    payload = _company_problem_payload(
-        company_id, problem_id, company_name, problem_name,
-        problem_type, description, posted_on, post_url, problem_url, created_at,
-    )
+    """
+    Insert one row into company_problems.
+    ON CONFLICT (company_id, problem_id) → silently skipped (idempotent).
+    """
+    payload = {
+        "company_id":   company_id,
+        "problem_id":   problem_id,
+        "company_name": company_name,
+        "problem_name": problem_name,
+        "problem_type": _normalize_problem_type(problem_type),
+        "description":  description,
+        "posted_on":    posted_on,
+        "post_url":     post_url,
+        "problem_url":  problem_url,
+        "created_at":   created_at or datetime.now(timezone.utc).isoformat(),
+    }
     resp = requests.post(
         _url("company_problems"),
         headers={**HEADERS, "Prefer": "return=minimal,resolution=ignore-duplicates"},
@@ -319,92 +310,9 @@ def insert_company_problem(
         timeout=10,
     )
     if not resp.ok:
-        log.warning(f"company_problems insert warning [{resp.status_code}]: {resp.text[:200]}")
+        # Non-fatal: the DB trigger already handles this; log but don't raise
+        log.warning(
+            f"company_problems insert warning [{resp.status_code}]: {resp.text[:200]}"
+        )
     else:
         log.info(f"company_problems ← '{problem_name}' → '{company_name}'")
-
-
-def insert_company_problem_returning_id(
-    company_id:   str,
-    problem_id:   str,
-    company_name: str,
-    problem_name: str,
-    problem_type: str,
-    description:  str,
-    posted_on:    str,
-    post_url:     str,
-    problem_url:  Optional[str] = None,
-    created_at:   Optional[str] = None,
-) -> Optional[str]:
-    """
-    Insert one row into company_problems and return its UUID.
-    Used by workflow so it can later update problem_url on the same row.
-    ON CONFLICT → returns the existing row's id (idempotent).
-    """
-    payload = _company_problem_payload(
-        company_id, problem_id, company_name, problem_name,
-        problem_type, description, posted_on, post_url, problem_url, created_at,
-    )
-    resp = requests.post(
-        _url("company_problems"),
-        headers={**HEADERS, "Prefer": "return=representation,resolution=merge-duplicates"},
-        json=payload,
-        params={"on_conflict": "company_id,problem_id"},
-        timeout=10,
-    )
-    if resp.ok:
-        data = resp.json()
-        if isinstance(data, list) and data:
-            cp_id = data[0].get("id")
-            log.info(f"company_problems ← '{problem_name}' → '{company_name}' [id={cp_id}]")
-            return cp_id
-    # Fallback: fetch existing row
-    log.warning(f"company_problems insert-returning failed [{resp.status_code}] — fetching existing")
-    get_resp = requests.get(
-        _url("company_problems"),
-        headers=HEADERS,
-        params={"company_id": f"eq.{company_id}", "problem_id": f"eq.{problem_id}", "select": "id"},
-        timeout=10,
-    )
-    if get_resp.ok:
-        rows = get_resp.json()
-        if rows:
-            return rows[0].get("id")
-    log.error(f"company_problems: could not get id for '{problem_name}'")
-    return None
-
-
-# ── problem_url update ────────────────────────────────────────────────────────
-
-def update_problem_url(problem_id: str, company_problem_id: str, problem_url: str) -> None:
-    """
-    Write the discovered LeetCode problem URL into:
-      1. problems table        (by problem_id UUID)
-      2. company_problems table (by company_problem_id UUID)
-    Both updates are non-fatal — logged but pipeline continues on failure.
-    """
-    # Update problems table
-    resp = requests.patch(
-        _url("problems"),
-        headers=HEADERS,
-        params={"id": f"eq.{problem_id}"},
-        json={"problem_url": problem_url},
-        timeout=10,
-    )
-    if resp.ok:
-        log.info(f"problems.problem_url updated → {problem_url} (id={problem_id})")
-    else:
-        log.warning(f"problems.problem_url update failed [{resp.status_code}]: {resp.text[:200]}")
-
-    # Update company_problems table
-    resp2 = requests.patch(
-        _url("company_problems"),
-        headers=HEADERS,
-        params={"id": f"eq.{company_problem_id}"},
-        json={"problem_url": problem_url},
-        timeout=10,
-    )
-    if resp2.ok:
-        log.info(f"company_problems.problem_url updated → {problem_url} (id={company_problem_id})")
-    else:
-        log.warning(f"company_problems.problem_url update failed [{resp2.status_code}]: {resp2.text[:200]}")
