@@ -93,10 +93,18 @@ def _build_payload(title: str, content: str) -> dict:
         "Each item must contain:\n"
         "problem_name (string)\n"
         "problem_type (coding or design)\n"
-        "company (string)\n\n"
+        "company (string)\n"
+        "search_keyword (string)\n\n"
+        "SEARCH KEYWORD RULES:\n"
+        "- search_keyword is the single best search term to find this exact problem on https://leetcode.com/problemset/\n"
+        "- Use the most recognizable short name of the problem (e.g. 'Two Sum', 'LRU Cache', 'Word Break')\n"
+        "- If the problem maps to a well-known LeetCode problem, use its exact LeetCode title\n"
+        "- If unsure, use the most specific 1-4 word phrase from problem_name\n"
+        "- Never use generic terms like 'array', 'graph', 'coding problem'\n"
+        "- If no problems found, use empty string\n\n"
         "EDGE CASE:\n"
         "If no problems:\n"
-        '[{"problem_name":"No Problems Found","problem_type":"none","company":"Unknown"}]\n\n'
+        '[{"problem_name":"No Problems Found","problem_type":"none","company":"Unknown","search_keyword":""}]\n\n'
         f"POST TITLE:{title}\n\n"
         f"POST CONTENT:\n{content}"
     )
