@@ -49,22 +49,34 @@ def _strip_markdown(text: str) -> str:
     return text.strip()
 
 
-def parse_gemini_output(raw: str) -> Optional[list[dict]]:
+def parse_gemini_output(raw) -> Optional[list[dict]]:
     """
-    Parse raw Gemini text into a validated list[dict].
+    Parse raw Gemini text (or already-parsed list) into a validated list[dict].
     Returns None on failure (caller decides retry logic).
+
+    Handles two input types:
+      - str  : normal path — strip markdown fences, JSON-decode
+      - list : Gemini SDK already parsed the response (responseMimeType=json)
+               skip string processing and validate directly
     """
-    if not raw:
-        log.warning("Parser received empty string")
+    if raw is None:
+        log.warning("Parser received None")
         return None
 
-    cleaned = _strip_markdown(raw)
-
-    try:
-        parsed = json.loads(cleaned)
-    except json.JSONDecodeError as e:
-        log.warning(f"JSON decode error: {e} | raw: {cleaned[:200]}")
+    # Fast path: Gemini already returned a parsed list
+    if isinstance(raw, list):
+        log.info("Parser: received pre-parsed list — skipping string decode")
+        parsed = raw
+    elif not isinstance(raw, str) or not raw.strip():
+        log.warning(f"Parser received unexpected type or empty: {type(raw)}")
         return None
+    else:
+        cleaned = _strip_markdown(raw)
+        try:
+            parsed = json.loads(cleaned)
+        except json.JSONDecodeError as e:
+            log.warning(f"JSON decode error: {e} | raw: {cleaned[:200]}")
+            return None
 
     if not isinstance(parsed, list):
         log.warning(f"Expected JSON array, got {type(parsed).__name__}")
