@@ -138,6 +138,12 @@ def extract_problems(title: str, content: str) -> Optional[list[dict]]:
                     .get("parts", [{}])[0]
                     .get("text", "")
             )
+            # responseMimeType=application/json can cause the SDK or Gemini to
+            # return an already-parsed list/dict instead of a raw string.
+            # Always normalise to a plain string before handing off to parser.
+            import json as _json
+            if not isinstance(raw_text, str):
+                raw_text = _json.dumps(raw_text)
             log.info(f"Gemini raw (attempt {attempt}): {raw_text[:120]}")
             return raw_text   # hand off to parser for JSON validation + retry
 
