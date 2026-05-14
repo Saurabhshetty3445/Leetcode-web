@@ -10,6 +10,7 @@ If no problems found:
 from __future__ import annotations
 
 import json
+import re
 import time
 from typing import Optional
 
@@ -25,12 +26,60 @@ GEMINI_URL = (
     f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
 )
 
+
+def _extract_first_valid_json_array(text: str):
+    """
+    Safely extracts first valid JSON array from Gemini output.
+    Prevents:
+    - extra ] ]
+    - markdown blocks
+    - trailing garbage
+    - malformed wrappers
+    """
+
+    if not text:
+        raise ValueError("Empty Gemini response")
+
+    # remove markdown fences
+    text = text.replace("```json", "")
+    text = text.replace("```", "")
+    text = text.strip()
+
+    start = text.find("[")
+
+    if start == -1:
+        raise ValueError("No JSON array found")
+
+    bracket_count = 0
+
+    for i in range(start, len(text)):
+        char = text[i]
+
+        if char == "[":
+            bracket_count += 1
+
+        elif char == "]":
+            bracket_count -= 1
+
+            if bracket_count == 0:
+                json_candidate = text[start:i + 1]
+
+                # final cleanup
+                json_candidate = re.sub(r"\n+", "\n", json_candidate).strip()
+
+                return json.loads(json_candidate)
+
+    raise ValueError("Incomplete JSON array")
+
+
+
 def _build_payload(title: str, content: str) -> dict:
     """
     Build Gemini request payload using the master extraction prompt.
     POST_TITLE and POST_CONTENT are injected at the end of the prompt.
     problem_type is strictly "coding" or "design" (or "none" for no-problem case).
     """
+
     prompt_text = (
         "You are an expert system designed to aggressively extract and normalize ALL possible "
         "coding and system design problems from messy interview posts.\n\n"
@@ -114,37 +163,52 @@ def _build_payload(title: str, content: str) -> dict:
     }
 
 
+
 def extract_problems(title: str, content: str) -> Optional[list[dict]]:
     """
     Call Gemini to extract problems.
     Retries up to MAX_RETRY times on failure.
     Returns parsed list or None if all retries exhausted.
     """
-    for attempt in range(1, MAX_RETRY + 2):   # +2 → initial + MAX_RETRY retries
+
+    for attempt in range(1, MAX_RETRY + 2):
         try:
             resp = requests.post(
                 GEMINI_URL,
                 json=_build_payload(title, content),
                 timeout=30,
             )
+
             if not resp.ok:
                 log.warning(f"Gemini HTTP {resp.status_code} (attempt {attempt}): {resp.text[:200]}")
                 raise RuntimeError(f"Gemini HTTP {resp.status_code}")
 
             data = resp.json()
+
             raw_text = (
                 data.get("candidates", [{}])[0]
                     .get("content", {})
                     .get("parts", [{}])[0]
                     .get("text", "")
             )
+
             log.info(f"Gemini raw (attempt {attempt}): {raw_text[:120]}")
-            return raw_text   # hand off to parser for JSON validation + retry
+
+            # NEW: robust JSON cleaning + validation
+            parsed = _extract_first_valid_json_array(raw_text)
+
+            if not isinstance(parsed, list):
+                raise ValueError("Gemini response is not a JSON array")
+
+            log.info(f"Parser: {len(parsed)} problem(s) extracted")
+
+            return parsed
 
         except Exception as e:
-            log.warning(f"Gemini attempt {attempt} failed: {e}")
+            log.warning(f"JSON parse failed (attempt {attempt}): {e}")
+
             if attempt <= MAX_RETRY:
                 time.sleep(2 ** attempt)
 
-    log.error("Gemini: all retries exhausted")
+    log.error("Gemini+parse failed after all retries")
     return None
