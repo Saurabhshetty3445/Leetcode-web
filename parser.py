@@ -22,28 +22,64 @@ REQUIRED_KEYS = {"problem_name", "problem_type", "company"}
 
 def _strip_markdown(text: str) -> str:
     """
-    Remove any markdown fences or stray backtick sequences Gemini appends.
-    Handles all observed variants:
-      - ```json ... ```   full fenced block
-      - ```               opening fence only
-      - ``                double backtick suffix (seen in logs)
-      - `                 single stray backtick
-    Final step: extract only the content between the first [ and last ]
-    so any trailing garbage after the JSON array is discarded entirely.
+    Remove markdown fences, stray backticks, and any trailing garbage.
+
+    Observed Gemini output variants this handles:
+      - ```json ... ```        full fenced block
+      - ```                    opening fence only
+      - ``                     double backtick suffix
+      - `                      single stray backtick
+      - valid JSON ] followed  by `` then another stray ]
+        e.g:  [...}]\n``\n]   ← the exact pattern from logs
+
+    Strategy:
+      1. Strip all backtick sequences anywhere in the text first
+      2. Then find the BALANCED JSON array by tracking [ ] depth
+         so we stop at the true closing bracket of the array,
+         not a stray ] appended after it
     """
     text = text.strip()
 
-    # Remove opening fence: ```json or ``` or `` or `
-    text = re.sub(r"^`{1,3}(?:json)?\s*", "", text)
+    # Step 1: remove all backtick sequences (```, ``, `)
+    text = re.sub(r"`{1,3}", "", text)
+    text = text.strip()
 
-    # Remove any closing backtick sequence (1, 2, or 3 backticks)
-    text = re.sub(r"\s*`{1,3}\s*$", "", text)
-
-    # Extract exactly the JSON array — everything from first [ to last ]
-    # This discards any stray text before or after the array
+    # Step 2: find the balanced JSON array start and end
+    # Walk from the first [ and track bracket depth — stop when depth hits 0
     start = text.find("[")
-    end   = text.rfind("]")
-    if start != -1 and end != -1 and end > start:
+    if start == -1:
+        return text
+
+    depth = 0
+    end   = -1
+    in_string = False
+    escape    = False
+
+    for i, ch in enumerate(text[start:], start):
+        if escape:
+            escape = False
+            continue
+        if ch == chr(92) and in_string:
+            escape = True
+            continue
+        if ch == '"' and not escape:
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0:
+                end = i
+                break   # stop at the TRUE closing bracket — ignore any ] after
+
+    if end == -1:
+        # Fallback: use rfind if balanced walk failed
+        end = text.rfind("]")
+
+    if end != -1 and end > start:
         text = text[start:end + 1]
 
     return text.strip()
