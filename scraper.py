@@ -725,6 +725,91 @@ def health():
     return jsonify({"status": "ok", "time": datetime.now(timezone.utc).isoformat()})
 
 
+# ── Manual links batch pipeline ───────────────────────────────────────────────
+# Separate from /run — processes URLs stored in leetcode_links Supabase table.
+# POST /process-links       → starts batch, returns 202 with run_id
+# GET  /process-links/status → poll for result
+
+_links_lock = threading.Lock()
+_links_state: dict = {
+    "status":     "idle",
+    "run_id":     None,
+    "started_at": None,
+    "finished_at": None,
+    "summary":    None,
+}
+
+
+def _execute_links_bg(run_id: str) -> None:
+    """Background thread — runs the links batch pipeline."""
+    global _links_state
+    try:
+        from links_workflow import run_links_pipeline
+        summary = run_links_pipeline(scrape_fn=scrape_post_detail)
+        _links_state.update({
+            "status":      "done",
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "summary":     summary,
+        })
+        log.info(f"[links run_id={run_id}] Batch finished: {summary}")
+    except Exception as e:
+        log.exception(f"[links run_id={run_id}] Batch crashed: {e}")
+        _links_state.update({
+            "status":      "error",
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "summary":     {"error": str(e)},
+        })
+    finally:
+        _links_lock.release()
+
+
+@app.route("/process-links", methods=["POST"])
+def process_links_endpoint():
+    """
+    Trigger batch processing of pending links in leetcode_links table.
+    Returns 202 immediately — poll /process-links/status for result.
+    Returns 409 if a batch is already running.
+    """
+    if not auth_check():
+        return jsonify({"error": "Unauthorized"}), 401
+
+    acquired = _links_lock.acquire(blocking=False)
+    if not acquired:
+        return jsonify({
+            "status":  "busy",
+            "message": "Links batch already running",
+            "run_id":  _links_state.get("run_id"),
+        }), 409
+
+    run_id = str(uuid.uuid4())[:8]
+    _links_state.update({
+        "status":      "running",
+        "run_id":      run_id,
+        "started_at":  datetime.now(timezone.utc).isoformat(),
+        "finished_at": None,
+        "summary":     None,
+    })
+
+    t = threading.Thread(target=_execute_links_bg, args=(run_id,), daemon=True)
+    t.start()
+
+    log.info(f"[links run_id={run_id}] Links batch started in background")
+    return jsonify({
+        "status":     "started",
+        "run_id":     run_id,
+        "message":    "Links batch running. Poll /process-links/status for result.",
+        "status_url": "/process-links/status",
+    }), 202
+
+
+@app.route("/process-links/status", methods=["GET"])
+def process_links_status_endpoint():
+    """Poll this after POST /process-links to get batch progress and summary."""
+    if not auth_check():
+        return jsonify({"error": "Unauthorized"}), 401
+    return jsonify(_links_state), 200
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
