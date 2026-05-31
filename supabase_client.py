@@ -412,23 +412,77 @@ def update_problem_url(problem_id: str, company_problem_id: str, problem_url: st
 
 # ── Date filter helpers ───────────────────────────────────────────────────────
 
+def _normalize_date_for_query(date_str: str) -> str:
+    """
+    Convert any input date format into the partial string that will match
+    the RFC 2822 format stored in the DB: "Sun, 31 May 2026 05:03:07 GMT"
+
+    Examples:
+      "2026-05-31"      → "31 May 2026"
+      "31 May 2026"     → "31 May 2026"   (already correct)
+      "May 31, 2026"    → "31 May 2026"
+      "31-05-2026"      → "31 May 2026"
+
+    Falls back to the raw input if parsing fails.
+    """
+    from datetime import datetime as _dt
+    import re
+
+    s = date_str.strip()
+
+    # Try ISO format: 2026-05-31
+    m = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})$", s)
+    if m:
+        try:
+            dt = _dt(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+            return dt.strftime("%-d %b %Y")   # "31 May 2026"
+        except Exception:
+            pass
+
+    # Try DD-MM-YYYY
+    m = re.match(r"^(\d{1,2})-(\d{1,2})-(\d{4})$", s)
+    if m:
+        try:
+            dt = _dt(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+            return dt.strftime("%-d %b %Y")
+        except Exception:
+            pass
+
+    # Try "May 31, 2026" or "May 31 2026"
+    for fmt in ("%B %d, %Y", "%B %d %Y", "%b %d, %Y", "%b %d %Y"):
+        try:
+            dt = _dt.strptime(s, fmt)
+            return dt.strftime("%-d %b %Y")
+        except ValueError:
+            pass
+
+    # Already in correct format "31 May 2026" or partial — use as-is
+    return s
+
+
 def get_problems_by_posted_on(date_str: str) -> list[dict]:
     """
-    Fetch all problems where posted_on contains `date_str`.
-    date_str can be a partial match e.g. "2026-05-27" or "May 27, 2026".
+    Fetch all problems where posted_on contains the given date.
+    Normalises date_str to match the RFC 2822 format stored in DB
+    e.g. "2026-05-31" → queries for "31 May 2026" which matches
+    "Sun, 31 May 2026 05:03:07 GMT".
     Returns list of {id, post_url, posted_on, problem_name}.
     """
+    search_term = _normalize_date_for_query(date_str)
+    log.info(f"get_problems_by_posted_on: {date_str!r} → searching for {search_term!r}")
     resp = requests.get(
         _url("problems"),
         headers=HEADERS,
         params={
-            "posted_on": f"ilike.*{date_str}*",
+            "posted_on": f"ilike.*{search_term}*",
             "select":    "id,post_url,posted_on,problem_name",
         },
         timeout=15,
     )
     _raise(resp, "get_problems_by_posted_on")
-    return resp.json()
+    results = resp.json()
+    log.info(f"get_problems_by_posted_on: found {len(results)} problem(s)")
+    return results
 
 
 def update_posted_on_by_post_url(post_url: str, new_posted_on: str) -> int:
