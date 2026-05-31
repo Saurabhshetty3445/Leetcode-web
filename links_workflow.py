@@ -233,7 +233,7 @@ def run_links_pipeline(scrape_fn) -> dict:
 
     Returns summary dict.
     """
-    from scraper import build_driver, load_cookies_from_env
+    from scraper import build_driver, load_cookies_from_env, scrape_post_detail_with_date
 
     summary = {
         "status":          "ok",
@@ -276,11 +276,14 @@ def run_links_pipeline(scrape_fn) -> dict:
             note     = link.get("note", "") or ""
             log.info(f"══ Link [{i}/{len(links)}]: {post_url} ══")
 
-            # ── Scrape ────────────────────────────────────────────────────────
-            raw_text = None
+            # ── Scrape + extract real post date in one call ───────────────────
+            # scrape_post_detail_with_date waits for React <time> element
+            # before parsing — ensures we get the real posting date, not today.
+            raw_text  = None
+            timestamp = None
             for attempt in range(1, MAX_RETRY + 2):
                 try:
-                    raw_text = scrape_fn(driver, post_url)
+                    raw_text, timestamp = scrape_post_detail_with_date(driver, post_url)
                     if raw_text:
                         break
                     log.warning(f"Scrape empty (attempt {attempt}): {post_url}")
@@ -289,10 +292,6 @@ def run_links_pipeline(scrape_fn) -> dict:
                 if attempt <= MAX_RETRY:
                     time.sleep(2)
 
-            # Extract real post date AFTER scraping (page is already loaded in driver)
-            timestamp = scrape_post_date(driver, post_url)
-            log.info(f"Post date: {timestamp}")
-
             if not raw_text:
                 log.error(f"Scrape failed for: {post_url}")
                 mark_link(link_id, "error")
@@ -300,7 +299,7 @@ def run_links_pipeline(scrape_fn) -> dict:
                 summary["errors"].append(f"scrape_fail:{post_url}")
                 continue
 
-            log.info(f"Scraped {len(raw_text)} chars")
+            log.info(f"Scraped {len(raw_text)} chars | Post date: {timestamp}")
 
             # ── Clean ─────────────────────────────────────────────────────────
             cleaned = clean_text(raw_text)
