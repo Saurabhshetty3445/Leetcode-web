@@ -725,6 +725,177 @@ def health():
     return jsonify({"status": "ok", "time": datetime.now(timezone.utc).isoformat()})
 
 
+# ── Date filter pipeline ──────────────────────────────────────────────────────
+# POST /date-filter/<date>   → find all problems with that posted_on date,
+#                              scrape each unique post_url to get the real date,
+#                              update posted_on on all matching problems
+# GET  /date-filter/status   → poll for result
+
+_date_filter_lock = threading.Lock()
+_date_filter_state: dict = {
+    "status":     "idle",
+    "run_id":     None,
+    "date":       None,
+    "started_at": None,
+    "finished_at": None,
+    "summary":    None,
+}
+
+
+def _execute_date_filter_bg(run_id: str, date_str: str) -> None:
+    """Background thread — runs the date filter correction pipeline."""
+    global _date_filter_state
+    try:
+        import supabase_client as _db
+        from links_workflow import scrape_post_date
+
+        log.info(f"[date-filter run_id={run_id}] Starting for date: {date_str!r}")
+
+        # ── 1. Fetch all problems with this posted_on date ────────────────────
+        problems = _db.get_problems_by_posted_on(date_str)
+        log.info(f"[date-filter] Found {len(problems)} problem(s) matching {date_str!r}")
+
+        if not problems:
+            _date_filter_state.update({
+                "status":      "done",
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+                "summary": {
+                    "date":             date_str,
+                    "problems_found":   0,
+                    "links_found":      0,
+                    "links_scraped":    0,
+                    "problems_updated": 0,
+                    "errors":           [],
+                },
+            })
+            return
+
+        # ── 2. Collect unique post_urls ───────────────────────────────────────
+        unique_urls = list({p["post_url"] for p in problems if p.get("post_url")})
+        log.info(f"[date-filter] Unique post URLs: {len(unique_urls)}")
+
+        summary = {
+            "date":             date_str,
+            "problems_found":   len(problems),
+            "links_found":      len(unique_urls),
+            "links_scraped":    0,
+            "problems_updated": 0,
+            "errors":           [],
+        }
+
+        cookies = load_cookies_from_env()
+        driver  = None
+
+        try:
+            driver = build_driver(cookies)
+
+            # Warm-up
+            driver.get("https://leetcode.com")
+            time.sleep(3)
+
+            for i, post_url in enumerate(unique_urls, 1):
+                log.info(f"[date-filter] Scraping [{i}/{len(unique_urls)}]: {post_url}")
+                try:
+                    # Navigate to the post to load the page
+                    scrape_post_detail(driver, post_url)
+
+                    # Extract real post date from the now-loaded page
+                    real_date = scrape_post_date(driver, post_url)
+                    log.info(f"[date-filter] Real date: {real_date}")
+                    summary["links_scraped"] += 1
+
+                    # Update all problems with this post_url
+                    updated = _db.update_posted_on_by_post_url(post_url, real_date)
+                    summary["problems_updated"] += updated
+                    log.info(f"[date-filter] Updated {updated} problem(s) for {post_url}")
+
+                except Exception as e:
+                    log.error(f"[date-filter] Failed for {post_url}: {e}")
+                    summary["errors"].append(f"fail:{post_url}:{str(e)[:80]}")
+
+                time.sleep(1)
+
+        finally:
+            if driver:
+                driver.quit()
+                log.info("[date-filter] Driver closed")
+
+        _date_filter_state.update({
+            "status":      "done",
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "summary":     summary,
+        })
+        log.info(f"[date-filter run_id={run_id}] Complete: {summary}")
+
+    except Exception as e:
+        log.exception(f"[date-filter run_id={run_id}] Crashed: {e}")
+        _date_filter_state.update({
+            "status":      "error",
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "summary":     {"error": str(e)},
+        })
+    finally:
+        _date_filter_lock.release()
+
+
+@app.route("/date-filter/<path:date_str>", methods=["POST"])
+def date_filter_endpoint(date_str: str):
+    """
+    Trigger posted_on correction for all problems matching a date string.
+    date_str: any partial date e.g. '2026-05-27', 'May 27', 'Mon, 27 May 2026'
+    Returns 202 immediately — poll /date-filter/status for result.
+    Returns 409 if already running.
+    """
+    if not auth_check():
+        return jsonify({"error": "Unauthorized"}), 401
+
+    date_str = date_str.strip()
+    if not date_str:
+        return jsonify({"error": "Date string required in URL"}), 400
+
+    acquired = _date_filter_lock.acquire(blocking=False)
+    if not acquired:
+        return jsonify({
+            "status":  "busy",
+            "message": "Date filter already running",
+            "run_id":  _date_filter_state.get("run_id"),
+        }), 409
+
+    run_id = str(uuid.uuid4())[:8]
+    _date_filter_state.update({
+        "status":      "running",
+        "run_id":      run_id,
+        "date":        date_str,
+        "started_at":  datetime.now(timezone.utc).isoformat(),
+        "finished_at": None,
+        "summary":     None,
+    })
+
+    t = threading.Thread(
+        target=_execute_date_filter_bg,
+        args=(run_id, date_str),
+        daemon=True,
+    )
+    t.start()
+
+    log.info(f"[date-filter run_id={run_id}] Started for date: {date_str!r}")
+    return jsonify({
+        "status":     "started",
+        "run_id":     run_id,
+        "date":       date_str,
+        "message":    "Date filter running. Poll /date-filter/status for result.",
+        "status_url": "/date-filter/status",
+    }), 202
+
+
+@app.route("/date-filter/status", methods=["GET"])
+def date_filter_status_endpoint():
+    """Poll this after POST /date-filter/<date> to get progress and summary."""
+    if not auth_check():
+        return jsonify({"error": "Unauthorized"}), 401
+    return jsonify(_date_filter_state), 200
+
+
 # ── Manual links batch pipeline ───────────────────────────────────────────────
 # Separate from /run — processes URLs stored in leetcode_links Supabase table.
 # POST /process-links       → starts batch, returns 202 with run_id
