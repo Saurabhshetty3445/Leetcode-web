@@ -32,6 +32,79 @@ log = get_logger("links_workflow")
 
 BATCH_SIZE = 10
 
+
+# ── Real post date extraction ─────────────────────────────────────────────────
+
+def scrape_post_date(driver, url: str) -> str:
+    """
+    Extract the real posting date from a LeetCode discuss post page.
+    LeetCode renders post time in <time datetime="..."> or data-tooltip attributes.
+
+    Returns RFC 2822 formatted date string e.g. "Mon, 27 May 2026 08:30:00 GMT"
+    Falls back to current UTC time if the date cannot be found.
+    """
+    from bs4 import BeautifulSoup
+    from email.utils import formatdate
+    from datetime import datetime as _dt, timezone as _tz
+
+    try:
+        # Page should already be loaded by scrape_post_detail — re-parse source
+        soup = BeautifulSoup(driver.page_source, "html.parser")
+
+        # Strategy 1: <time> tag with datetime attribute (most reliable)
+        time_tag = soup.find("time", attrs={"datetime": True})
+        if time_tag:
+            dt_str = time_tag["datetime"].strip()
+            # Try ISO 8601 formats
+            for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ",
+                        "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%d"):
+                try:
+                    dt = _dt.strptime(dt_str.rstrip("Z"), fmt.rstrip("Z"))
+                    dt = dt.replace(tzinfo=_tz.utc)
+                    result = formatdate(dt.timestamp(), usegmt=True)
+                    log.info(f"Post date from <time>: {result}")
+                    return result
+                except ValueError:
+                    continue
+
+        # Strategy 2: spans with data-tooltip containing full date
+        for span in soup.find_all(["span", "div"], attrs={"data-tooltip": True}):
+            tooltip = span.get("data-tooltip", "").strip()
+            import re
+            # Match patterns like "May 27, 2026" or "2026-05-27"
+            m = re.search(r"(\w{3,9}\s+\d{1,2},?\s+\d{4})", tooltip)
+            if m:
+                try:
+                    dt = _dt.strptime(m.group(1).replace(",", ""), "%B %d %Y")
+                    dt = dt.replace(tzinfo=_tz.utc)
+                    result = formatdate(dt.timestamp(), usegmt=True)
+                    log.info(f"Post date from data-tooltip: {result}")
+                    return result
+                except ValueError:
+                    pass
+
+        # Strategy 3: look for date text in post header area
+        import re
+        page_text = soup.get_text(" ")
+        m = re.search(r"(\w{3,9}\s+\d{1,2},?\s+\d{4})", page_text)
+        if m:
+            try:
+                dt = _dt.strptime(m.group(1).replace(",", ""), "%B %d %Y")
+                dt = dt.replace(tzinfo=_tz.utc)
+                result = formatdate(dt.timestamp(), usegmt=True)
+                log.info(f"Post date from page text: {result}")
+                return result
+            except ValueError:
+                pass
+
+    except Exception as e:
+        log.warning(f"scrape_post_date error: {e}")
+
+    # Fallback: current UTC time
+    fallback = formatdate(usegmt=True)
+    log.warning(f"Could not extract post date — using current time: {fallback}")
+    return fallback
+
 _HEADERS = {
     "apikey":        SUPABASE_KEY,
     "Authorization": f"Bearer {SUPABASE_KEY}",
@@ -201,8 +274,6 @@ def run_links_pipeline(scrape_fn) -> dict:
             link_id  = link["id"]
             post_url = link["url"].strip()
             note     = link.get("note", "") or ""
-            timestamp = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
-
             log.info(f"══ Link [{i}/{len(links)}]: {post_url} ══")
 
             # ── Scrape ────────────────────────────────────────────────────────
@@ -217,6 +288,10 @@ def run_links_pipeline(scrape_fn) -> dict:
                     log.warning(f"Scrape error attempt {attempt}: {e}")
                 if attempt <= MAX_RETRY:
                     time.sleep(2)
+
+            # Extract real post date AFTER scraping (page is already loaded in driver)
+            timestamp = scrape_post_date(driver, post_url)
+            log.info(f"Post date: {timestamp}")
 
             if not raw_text:
                 log.error(f"Scrape failed for: {post_url}")
