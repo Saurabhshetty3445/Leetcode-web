@@ -270,44 +270,66 @@ def scrape_post_detail_with_date(driver: webdriver.Chrome, url: str) -> tuple:
             except TimeoutException:
                 continue
 
-        # ── Wait explicitly for <time> element (React renders this late) ──────
+        # ── Wait for LeetCode date span: <span data-state="closed">May 30, 2026</span>
+        # This is the primary date element LeetCode React renders for post timestamps.
         try:
-            WebDriverWait(driver, 8).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "time[datetime]"))
+            WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located(
+                    (By.CSS_SELECTOR, 'span[data-state="closed"]')
+                )
             )
-            log.info("scrape_post_detail_with_date: <time> element found")
+            log.info("scrape_post_detail_with_date: date span found")
         except TimeoutException:
-            log.warning("scrape_post_detail_with_date: <time> not found within 8s — trying JS wait")
-            # Extra JS wait for React hydration
-            time.sleep(2)
+            log.warning("scrape_post_detail_with_date: date span not found — waiting 3s for hydration")
+            time.sleep(3)
 
         # ── Parse fully-rendered page ─────────────────────────────────────────
         soup = BeautifulSoup(driver.page_source, "html.parser")
 
         # ── Extract date ──────────────────────────────────────────────────────
-        # Strategy 1: <time datetime="..."> — most reliable
-        time_tag = soup.find("time", attrs={"datetime": True})
-        if time_tag:
-            dt_str = time_tag["datetime"].strip()
-            log.info(f"scrape_post_detail_with_date: raw datetime attr = {dt_str!r}")
-            for fmt in (
-                "%Y-%m-%dT%H:%M:%S.%fZ",
-                "%Y-%m-%dT%H:%M:%SZ",
-                "%Y-%m-%dT%H:%M:%S",
-                "%Y-%m-%dT%H:%M",
-                "%Y-%m-%d",
-            ):
+
+        # Strategy 1 (PRIMARY): <span data-state="closed">May 30, 2026</span>
+        # This is the exact element LeetCode uses for post timestamps.
+        _date_pattern = _re.compile(
+            r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},?\s+\d{4}$",
+            _re.IGNORECASE,
+        )
+        for span in soup.find_all("span", attrs={"data-state": "closed"}):
+            text = span.get_text(strip=True)
+            if _date_pattern.match(text):
                 try:
-                    cleaned = dt_str.rstrip("Z").split("+")[0].split("-0")[0]
-                    dt = _dt.strptime(cleaned, fmt.rstrip("Z"))
+                    dt = _dt.strptime(text.replace(",", ""), "%b %d %Y")
                     dt = dt.replace(tzinfo=_tz.utc)
                     posted_on = _fmtdate(dt.timestamp(), usegmt=True)
-                    log.info(f"scrape_post_detail_with_date: date = {posted_on}")
+                    log.info(f"scrape_post_detail_with_date: date from span[data-state=closed] = {posted_on}")
                     break
                 except ValueError:
-                    continue
+                    pass
 
-        # Strategy 2: find all <time> tags by JS-rendered text (e.g. "2 hours ago")
+        # Strategy 2: <time datetime="..."> attribute
+        if not posted_on:
+            time_tag = soup.find("time", attrs={"datetime": True})
+            if time_tag:
+                dt_str = time_tag["datetime"].strip()
+                log.info(f"scrape_post_detail_with_date: raw datetime attr = {dt_str!r}")
+                for fmt in (
+                    "%Y-%m-%dT%H:%M:%S.%fZ",
+                    "%Y-%m-%dT%H:%M:%SZ",
+                    "%Y-%m-%dT%H:%M:%S",
+                    "%Y-%m-%dT%H:%M",
+                    "%Y-%m-%d",
+                ):
+                    try:
+                        cleaned = dt_str.rstrip("Z").split("+")[0]
+                        dt = _dt.strptime(cleaned, fmt.rstrip("Z"))
+                        dt = dt.replace(tzinfo=_tz.utc)
+                        posted_on = _fmtdate(dt.timestamp(), usegmt=True)
+                        log.info(f"scrape_post_detail_with_date: date from <time> = {posted_on}")
+                        break
+                    except ValueError:
+                        continue
+
+        # Strategy 3: any <time> title/data-tooltip attribute
         if not posted_on:
             for t in soup.find_all("time"):
                 tooltip = t.get("title", "") or t.get("data-tooltip", "")
@@ -317,12 +339,12 @@ def scrape_post_detail_with_date(driver: webdriver.Chrome, url: str) -> tuple:
                         dt = _dt.strptime(m.group(1).replace(",", ""), "%B %d %Y")
                         dt = dt.replace(tzinfo=_tz.utc)
                         posted_on = _fmtdate(dt.timestamp(), usegmt=True)
-                        log.info(f"scrape_post_detail_with_date: date from title attr = {posted_on}")
+                        log.info(f"scrape_post_detail_with_date: date from time title = {posted_on}")
                         break
                     except ValueError:
                         pass
 
-        # Strategy 3: data-tooltip on any element with a month name
+        # Strategy 4: data-tooltip on any element
         if not posted_on:
             for el in soup.find_all(attrs={"data-tooltip": True}):
                 tooltip = el["data-tooltip"]
