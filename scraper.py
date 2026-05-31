@@ -234,6 +234,160 @@ def scrape_post_detail(driver: webdriver.Chrome, url: str) -> Optional[str]:
         return None
 
 
+def scrape_post_detail_with_date(driver: webdriver.Chrome, url: str) -> tuple:
+    """
+    Scrape post content AND the real posting date from a LeetCode discuss post.
+
+    Unlike scrape_post_date (which re-parses an already-loaded page and often
+    misses the React-rendered <time> tag), this function:
+      1. Navigates to the URL
+      2. Waits for content (div.break-words) to load
+      3. Explicitly waits up to 8s for a <time> element to appear
+      4. Parses both content and timestamp from the same fully-rendered page
+
+    Returns:
+        (content: str | None, posted_on: str)
+        posted_on is RFC 2822 format e.g. "Mon, 27 May 2026 08:30:00 GMT"
+        Falls back to current UTC time only if no date found after full wait.
+    """
+    import re as _re
+    from email.utils import formatdate as _fmtdate
+    from datetime import datetime as _dt, timezone as _tz
+
+    content   = None
+    posted_on = None
+
+    try:
+        driver.get(url)
+
+        # ── Wait for main content ─────────────────────────────────────────────
+        for sel in ["div.break-words", "div[class*='break-words']", "h1", "body"]:
+            try:
+                WebDriverWait(driver, 12).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, sel))
+                )
+                break
+            except TimeoutException:
+                continue
+
+        # ── Wait explicitly for <time> element (React renders this late) ──────
+        try:
+            WebDriverWait(driver, 8).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "time[datetime]"))
+            )
+            log.info("scrape_post_detail_with_date: <time> element found")
+        except TimeoutException:
+            log.warning("scrape_post_detail_with_date: <time> not found within 8s — trying JS wait")
+            # Extra JS wait for React hydration
+            time.sleep(2)
+
+        # ── Parse fully-rendered page ─────────────────────────────────────────
+        soup = BeautifulSoup(driver.page_source, "html.parser")
+
+        # ── Extract date ──────────────────────────────────────────────────────
+        # Strategy 1: <time datetime="..."> — most reliable
+        time_tag = soup.find("time", attrs={"datetime": True})
+        if time_tag:
+            dt_str = time_tag["datetime"].strip()
+            log.info(f"scrape_post_detail_with_date: raw datetime attr = {dt_str!r}")
+            for fmt in (
+                "%Y-%m-%dT%H:%M:%S.%fZ",
+                "%Y-%m-%dT%H:%M:%SZ",
+                "%Y-%m-%dT%H:%M:%S",
+                "%Y-%m-%dT%H:%M",
+                "%Y-%m-%d",
+            ):
+                try:
+                    cleaned = dt_str.rstrip("Z").split("+")[0].split("-0")[0]
+                    dt = _dt.strptime(cleaned, fmt.rstrip("Z"))
+                    dt = dt.replace(tzinfo=_tz.utc)
+                    posted_on = _fmtdate(dt.timestamp(), usegmt=True)
+                    log.info(f"scrape_post_detail_with_date: date = {posted_on}")
+                    break
+                except ValueError:
+                    continue
+
+        # Strategy 2: find all <time> tags by JS-rendered text (e.g. "2 hours ago")
+        if not posted_on:
+            for t in soup.find_all("time"):
+                tooltip = t.get("title", "") or t.get("data-tooltip", "")
+                m = _re.search(r"(\w{3,9}\s+\d{1,2},?\s+\d{4})", tooltip)
+                if m:
+                    try:
+                        dt = _dt.strptime(m.group(1).replace(",", ""), "%B %d %Y")
+                        dt = dt.replace(tzinfo=_tz.utc)
+                        posted_on = _fmtdate(dt.timestamp(), usegmt=True)
+                        log.info(f"scrape_post_detail_with_date: date from title attr = {posted_on}")
+                        break
+                    except ValueError:
+                        pass
+
+        # Strategy 3: data-tooltip on any element with a month name
+        if not posted_on:
+            for el in soup.find_all(attrs={"data-tooltip": True}):
+                tooltip = el["data-tooltip"]
+                m = _re.search(r"(\w{3,9}\s+\d{1,2},?\s+\d{4})", tooltip)
+                if m:
+                    try:
+                        dt = _dt.strptime(m.group(1).replace(",", ""), "%B %d %Y")
+                        dt = dt.replace(tzinfo=_tz.utc)
+                        posted_on = _fmtdate(dt.timestamp(), usegmt=True)
+                        log.info(f"scrape_post_detail_with_date: date from data-tooltip = {posted_on}")
+                        break
+                    except ValueError:
+                        pass
+
+        # ── Extract content (same logic as scrape_post_detail) ────────────────
+        for tag in soup.select("nav, footer, header, script, style, aside"):
+            tag.decompose()
+
+        CONTENT_TAGS = ["p", "ul", "li", "b", "h1", "h2", "h3", "h4", "i", "span"]
+        lines = []
+
+        def extract_from(container):
+            for tag in container.find_all(CONTENT_TAGS):
+                text = tag.get_text(separator=" ", strip=True)
+                if text and len(text) > 1:
+                    if tag.name in ["h1", "h2", "h3", "h4"]:
+                        lines.append(f"[{tag.name.upper()}] {text}")
+                    elif tag.name == "li":
+                        lines.append(f"- {text}")
+                    else:
+                        lines.append(text)
+
+        container = soup.select_one("div.break-words")
+        if container:
+            extract_from(container)
+        if not lines:
+            container = soup.find("div", class_=lambda c: c and "break-words" in c)
+            if container:
+                extract_from(container)
+        if not lines:
+            extract_from(soup)
+        if not lines:
+            try:
+                body = driver.find_element(By.TAG_NAME, "body").text
+                lines = [body[:3000]]
+            except Exception:
+                pass
+
+        full_text = "\n".join(lines)
+        full_text = _re.sub(r"\n{3,}", "\n\n", full_text).strip()
+        if len(full_text) > 6000:
+            full_text = full_text[:6000].strip() + "..."
+        content = full_text if full_text else None
+
+    except Exception as e:
+        log.error(f"scrape_post_detail_with_date failed for {url}: {e}")
+
+    # Fallback date only if nothing worked
+    if not posted_on:
+        posted_on = _fmtdate(usegmt=True)
+        log.warning(f"scrape_post_detail_with_date: no date found — fallback: {posted_on}")
+
+    return content, posted_on
+
+
 def is_today_strict(timestamp: str) -> bool:
     import re
     t = timestamp.strip().lower()
@@ -796,11 +950,8 @@ def _execute_date_filter_bg(run_id: str, date_str: str) -> None:
             for i, post_url in enumerate(unique_urls, 1):
                 log.info(f"[date-filter] Scraping [{i}/{len(unique_urls)}]: {post_url}")
                 try:
-                    # Navigate to the post to load the page
-                    scrape_post_detail(driver, post_url)
-
-                    # Extract real post date from the now-loaded page
-                    real_date = scrape_post_date(driver, post_url)
+                    # Use combined scrape — waits for React <time> before parsing
+                    _, real_date = scrape_post_detail_with_date(driver, post_url)
                     log.info(f"[date-filter] Real date: {real_date}")
                     summary["links_scraped"] += 1
 
