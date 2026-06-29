@@ -511,6 +511,12 @@ def scrape_listing(driver: webdriver.Chrome, url: str, max_posts: int = 6) -> li
         log.error("Timed out — no post cards found after all wait selectors")
         log.info("PAGE TITLE: " + driver.title)
         log.info("PAGE SNIPPET: " + driver.page_source[:2000])
+        if "just a moment" in driver.title.lower() or "cloudflare" in driver.title.lower():
+            log.error("Cloudflare block in scrape_listing — triggering redeploy")
+            try:
+                trigger_railway_redeploy()
+            except Exception as _rd_err:
+                log.error(f"Redeploy call failed: {_rd_err}")
         return []
 
     for _ in range(3):
@@ -656,6 +662,34 @@ def run_list_cycle() -> list:
 
     try:
         driver = build_driver(cookies)
+
+        # ── Warm-up: wait for Cloudflare to clear before hitting discuss pages ─
+        # When cookies expire/change, LeetCode redirects through a Cloudflare
+        # JS challenge on the first request. Navigating to the homepage first
+        # and polling until the challenge clears gives the session time to
+        # establish before we hit the discussion listing pages.
+        log.info("Warm-up: navigating to leetcode.com to establish session")
+        driver.get("https://leetcode.com")
+
+        # Poll up to 15s for Cloudflare to clear
+        for _attempt in range(15):
+            title = driver.title.lower()
+            if "just a moment" in title or "cloudflare" in title:
+                log.info(f"Warm-up: Cloudflare challenge active (attempt {_attempt+1}/15) — waiting 1s")
+                time.sleep(1)
+                # Re-check after each second
+                continue
+            # Page loaded normally
+            log.info(f"Warm-up complete — title: {driver.title!r}")
+            break
+        else:
+            # Still blocked after 15s — trigger redeploy for fresh container
+            log.error("Warm-up: Cloudflare did not clear after 15s — triggering redeploy")
+            trigger_railway_redeploy()
+            raise RuntimeError("Cloudflare block on warm-up — redeploying")
+
+        # Extra settle time for React hydration and cookie propagation
+        time.sleep(3)
 
         log.info(f"Scraping URL1: {LEETCODE_URL_1}")
         raw1 = scrape_listing(driver, LEETCODE_URL_1, max_posts=MAX_POSTS_URL1)
