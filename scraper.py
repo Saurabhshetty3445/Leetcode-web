@@ -745,8 +745,10 @@ def run_list_cycle() -> list:
 # After redeploy, the new container has a clean FD/process table.
 #
 # Required Railway env vars:
-#   RAILWAY_API_TOKEN  — from Railway dashboard → Account → Tokens
-#   RAILWAY_SERVICE_ID — from Railway dashboard → Service → Settings
+#   RAILWAY_API_TOKEN      — from Railway dashboard → Account → Tokens
+#   RAILWAY_SERVICE_ID     — from Railway dashboard → Service → Settings
+#   RAILWAY_ENVIRONMENT_ID — from Railway dashboard → Service → Settings
+#                            (Railway's API now requires this alongside serviceId)
 
 _REDEPLOY_FLAG = "/tmp/.railway_redeploy_triggered"
 
@@ -761,8 +763,9 @@ def trigger_railway_redeploy() -> bool:
         log.info("Auto-redeploy already triggered this session — skipping")
         return False
 
-    api_token  = os.environ.get("RAILWAY_API_TOKEN", "")
-    service_id = os.environ.get("RAILWAY_SERVICE_ID", "")
+    api_token      = os.environ.get("RAILWAY_API_TOKEN", "")
+    service_id     = os.environ.get("RAILWAY_SERVICE_ID", "")
+    environment_id = os.environ.get("RAILWAY_ENVIRONMENT_ID", "")
 
     if not api_token or not service_id:
         log.warning(
@@ -771,9 +774,19 @@ def trigger_railway_redeploy() -> bool:
         )
         return False
 
+    if not environment_id:
+        log.warning(
+            "Auto-redeploy skipped: RAILWAY_ENVIRONMENT_ID not set. "
+            "Railway's API requires this. Add it in Railway env vars "
+            "(Service → Settings → Environment ID)."
+        )
+        return False
+
+    # Railway's serviceInstanceRedeploy mutation requires BOTH serviceId
+    # and environmentId — sending only serviceId returns a 400 error.
     query = """
-    mutation serviceInstanceRedeploy($serviceId: String!) {
-      serviceInstanceRedeploy(serviceId: $serviceId)
+    mutation serviceInstanceRedeploy($serviceId: String!, $environmentId: String!) {
+      serviceInstanceRedeploy(serviceId: $serviceId, environmentId: $environmentId)
     }
     """
     try:
@@ -783,10 +796,20 @@ def trigger_railway_redeploy() -> bool:
                 "Authorization": f"Bearer {api_token}",
                 "Content-Type":  "application/json",
             },
-            json={"query": query, "variables": {"serviceId": service_id}},
+            json={
+                "query": query,
+                "variables": {
+                    "serviceId":     service_id,
+                    "environmentId": environment_id,
+                },
+            },
             timeout=15,
         )
         if resp.ok:
+            data = resp.json()
+            if data.get("errors"):
+                log.error(f"Railway redeploy GraphQL errors: {data['errors']}")
+                return False
             open(_REDEPLOY_FLAG, "w").write("1")   # set one-shot flag
             log.info(f"🔄 Railway auto-redeploy triggered (service={service_id})")
             return True
