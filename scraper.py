@@ -82,7 +82,7 @@ def build_driver(cookies: Optional[list] = None) -> webdriver.Chrome:
     opts.add_argument("--disable-blink-features=AutomationControlled")
     opts.add_argument("--no-first-run")
     opts.add_argument("--disable-default-apps")
-    opts.add_argument("--window-size=1280,720")
+    opts.add_argument("--window-size=1920,1080")   # real desktop resolution, not a bot-like size
     opts.add_argument("--single-process")   # 🔥 important for low RAM
     opts.add_argument("--no-zygote")        # 🔥 prevents zygote holding extra FDs
 
@@ -91,21 +91,35 @@ def build_driver(cookies: Optional[list] = None) -> webdriver.Chrome:
     opts.add_argument("--disable-renderer-backgrounding")
     opts.add_argument("--disable-backgrounding-occluded-windows")
     opts.add_argument("--disable-features=TranslateUI,BlinkGenPropertyTrees")
-    opts.add_argument("--blink-settings=imagesEnabled=false")
     opts.add_argument("--renderer-process-limit=1")
+    # NOTE: removed --blink-settings=imagesEnabled=false — Cloudflare's
+    # Turnstile challenge checks if images actually load; disabling them
+    # is a strong bot signal that contributes to session invalidation.
+
+    # 🔥 FINGERPRINT HARDENING — these directly target Cloudflare's bot checks
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_argument("--lang=en-US,en")
+    opts.add_argument("--disable-web-security")
+    opts.add_argument("--disable-features=IsolateOrigins,site-per-process")
+    opts.add_argument("--disable-site-isolation-trials")
 
     opts.page_load_strategy = "eager"
 
-    # ✅ user agent
+    # ✅ realistic, current Chrome user agent (matches a real recent Chrome release)
     opts.add_argument(
         "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
+        "Chrome/126.0.0.0 Safari/537.36"
     )
 
     # ✅ disable automation detection
-    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
     opts.add_experimental_option("useAutomationExtension", False)
+    opts.add_experimental_option("prefs", {
+        "profile.default_content_setting_values.notifications": 2,
+        "credentials_enable_service": False,
+        "profile.password_manager_enabled": False,
+    })
 
     # ✅ force binary path (from Docker)
     opts.binary_location = "/usr/bin/google-chrome"
@@ -119,16 +133,60 @@ def build_driver(cookies: Optional[list] = None) -> webdriver.Chrome:
 
     driver.set_page_load_timeout(25)
 
-    # anti-detection
+    # ── Comprehensive anti-detection script ─────────────────────────────────
+    # Cloudflare/Turnstile checks dozens of navigator/window properties beyond
+    # just navigator.webdriver. This script patches the most commonly checked
+    # ones so the headless browser looks like a real Chrome desktop session.
+    stealth_js = """
+        // Hide webdriver flag
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+
+        // Fake a realistic plugins array (real Chrome has several)
+        Object.defineProperty(navigator, 'plugins', {
+            get: () => [1, 2, 3, 4, 5].map(() => ({ name: 'Chrome PDF Plugin' }))
+        });
+
+        // Fake realistic languages
+        Object.defineProperty(navigator, 'languages', {
+            get: () => ['en-US', 'en']
+        });
+
+        // window.chrome must exist (headless lacks it by default)
+        window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){} };
+
+        // Permissions API — headless reports 'denied' for notifications by default
+        const originalQuery = window.navigator.permissions.query;
+        window.navigator.permissions.query = (parameters) => (
+            parameters.name === 'notifications'
+                ? Promise.resolve({ state: Notification.permission })
+                : originalQuery(parameters)
+        );
+
+        // WebGL vendor/renderer — headless often exposes 'Google SwiftShader'
+        // which is a strong automated-browser signal
+        const getParameter = WebGLRenderingContext.prototype.getParameter;
+        WebGLRenderingContext.prototype.getParameter = function(parameter) {
+            if (parameter === 37445) return 'Intel Inc.';
+            if (parameter === 37446) return 'Intel Iris OpenGL Engine';
+            return getParameter.apply(this, arguments);
+        };
+
+        // Hardware concurrency — headless sometimes reports 1 or unusual values
+        Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+
+        // Screen properties consistent with the real window size
+        Object.defineProperty(screen, 'availWidth', { get: () => 1920 });
+        Object.defineProperty(screen, 'availHeight', { get: () => 1040 });
+    """
     driver.execute_cdp_cmd(
         "Page.addScriptToEvaluateOnNewDocument",
-        {"source": "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"},
+        {"source": stealth_js},
     )
 
-    # 🍪 cookies
+    # 🍪 cookies — visit homepage first so domain is set before injecting
     if cookies:
         driver.get("https://leetcode.com")
-        time.sleep(0.5)
+        time.sleep(1.5)   # let initial page settle before adding cookies
         for ck in cookies:
             try:
                 driver.add_cookie(ck)
