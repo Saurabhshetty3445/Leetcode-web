@@ -731,6 +731,30 @@ def run_list_cycle() -> list:
         raw2 = scrape_listing(driver, LEETCODE_URL_2, max_posts=MAX_POSTS_URL2)
         log.info(f"URL2 returned {len(raw2)} posts")
 
+        # ── URL2 Cloudflare retry ────────────────────────────────────────────
+        # LeetCode can re-trigger a fresh Cloudflare JS challenge on the SECOND
+        # deep navigation even within an already-warmed-up session (URL1 can
+        # succeed while URL2 still hits "Just a moment..."). If URL2 returned
+        # zero posts and the page title shows a Cloudflare challenge, wait for
+        # it to clear and retry URL2 once before giving up.
+        if not raw2 and ("just a moment" in driver.title.lower() or "cloudflare" in driver.title.lower()):
+            log.warning("URL2 hit Cloudflare — re-warming and retrying once")
+            for _attempt in range(15):
+                title = driver.title.lower()
+                if "just a moment" in title or "cloudflare" in title:
+                    log.info(f"URL2 retry warm-up: challenge active (attempt {_attempt+1}/15) — waiting 1s")
+                    time.sleep(1)
+                    continue
+                log.info(f"URL2 retry warm-up complete — title: {driver.title!r}")
+                break
+            else:
+                log.warning("URL2 retry warm-up: Cloudflare did not clear after 15s — skipping retry")
+
+            time.sleep(2)
+            log.info(f"Retrying URL2: {LEETCODE_URL_2}")
+            raw2 = scrape_listing(driver, LEETCODE_URL_2, max_posts=MAX_POSTS_URL2)
+            log.info(f"URL2 retry returned {len(raw2)} posts")
+
         seen_urls = set()
         combined  = []
         for post in raw1 + raw2:
