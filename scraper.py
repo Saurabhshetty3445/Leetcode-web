@@ -270,66 +270,44 @@ def scrape_post_detail_with_date(driver: webdriver.Chrome, url: str) -> tuple:
             except TimeoutException:
                 continue
 
-        # ── Wait for LeetCode date span: <span data-state="closed">May 30, 2026</span>
-        # This is the primary date element LeetCode React renders for post timestamps.
+        # ── Wait explicitly for <time> element (React renders this late) ──────
         try:
-            WebDriverWait(driver, 10).until(
-                EC.presence_of_element_located(
-                    (By.CSS_SELECTOR, 'span[data-state="closed"]')
-                )
+            WebDriverWait(driver, 8).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "time[datetime]"))
             )
-            log.info("scrape_post_detail_with_date: date span found")
+            log.info("scrape_post_detail_with_date: <time> element found")
         except TimeoutException:
-            log.warning("scrape_post_detail_with_date: date span not found — waiting 3s for hydration")
-            time.sleep(3)
+            log.warning("scrape_post_detail_with_date: <time> not found within 8s — trying JS wait")
+            # Extra JS wait for React hydration
+            time.sleep(2)
 
         # ── Parse fully-rendered page ─────────────────────────────────────────
         soup = BeautifulSoup(driver.page_source, "html.parser")
 
         # ── Extract date ──────────────────────────────────────────────────────
-
-        # Strategy 1 (PRIMARY): <span data-state="closed">May 30, 2026</span>
-        # This is the exact element LeetCode uses for post timestamps.
-        _date_pattern = _re.compile(
-            r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},?\s+\d{4}$",
-            _re.IGNORECASE,
-        )
-        for span in soup.find_all("span", attrs={"data-state": "closed"}):
-            text = span.get_text(strip=True)
-            if _date_pattern.match(text):
+        # Strategy 1: <time datetime="..."> — most reliable
+        time_tag = soup.find("time", attrs={"datetime": True})
+        if time_tag:
+            dt_str = time_tag["datetime"].strip()
+            log.info(f"scrape_post_detail_with_date: raw datetime attr = {dt_str!r}")
+            for fmt in (
+                "%Y-%m-%dT%H:%M:%S.%fZ",
+                "%Y-%m-%dT%H:%M:%SZ",
+                "%Y-%m-%dT%H:%M:%S",
+                "%Y-%m-%dT%H:%M",
+                "%Y-%m-%d",
+            ):
                 try:
-                    dt = _dt.strptime(text.replace(",", ""), "%b %d %Y")
+                    cleaned = dt_str.rstrip("Z").split("+")[0].split("-0")[0]
+                    dt = _dt.strptime(cleaned, fmt.rstrip("Z"))
                     dt = dt.replace(tzinfo=_tz.utc)
                     posted_on = _fmtdate(dt.timestamp(), usegmt=True)
-                    log.info(f"scrape_post_detail_with_date: date from span[data-state=closed] = {posted_on}")
+                    log.info(f"scrape_post_detail_with_date: date = {posted_on}")
                     break
                 except ValueError:
-                    pass
+                    continue
 
-        # Strategy 2: <time datetime="..."> attribute
-        if not posted_on:
-            time_tag = soup.find("time", attrs={"datetime": True})
-            if time_tag:
-                dt_str = time_tag["datetime"].strip()
-                log.info(f"scrape_post_detail_with_date: raw datetime attr = {dt_str!r}")
-                for fmt in (
-                    "%Y-%m-%dT%H:%M:%S.%fZ",
-                    "%Y-%m-%dT%H:%M:%SZ",
-                    "%Y-%m-%dT%H:%M:%S",
-                    "%Y-%m-%dT%H:%M",
-                    "%Y-%m-%d",
-                ):
-                    try:
-                        cleaned = dt_str.rstrip("Z").split("+")[0]
-                        dt = _dt.strptime(cleaned, fmt.rstrip("Z"))
-                        dt = dt.replace(tzinfo=_tz.utc)
-                        posted_on = _fmtdate(dt.timestamp(), usegmt=True)
-                        log.info(f"scrape_post_detail_with_date: date from <time> = {posted_on}")
-                        break
-                    except ValueError:
-                        continue
-
-        # Strategy 3: any <time> title/data-tooltip attribute
+        # Strategy 2: find all <time> tags by JS-rendered text (e.g. "2 hours ago")
         if not posted_on:
             for t in soup.find_all("time"):
                 tooltip = t.get("title", "") or t.get("data-tooltip", "")
@@ -339,12 +317,12 @@ def scrape_post_detail_with_date(driver: webdriver.Chrome, url: str) -> tuple:
                         dt = _dt.strptime(m.group(1).replace(",", ""), "%B %d %Y")
                         dt = dt.replace(tzinfo=_tz.utc)
                         posted_on = _fmtdate(dt.timestamp(), usegmt=True)
-                        log.info(f"scrape_post_detail_with_date: date from time title = {posted_on}")
+                        log.info(f"scrape_post_detail_with_date: date from title attr = {posted_on}")
                         break
                     except ValueError:
                         pass
 
-        # Strategy 4: data-tooltip on any element
+        # Strategy 3: data-tooltip on any element with a month name
         if not posted_on:
             for el in soup.find_all(attrs={"data-tooltip": True}):
                 tooltip = el["data-tooltip"]
@@ -511,12 +489,6 @@ def scrape_listing(driver: webdriver.Chrome, url: str, max_posts: int = 6) -> li
         log.error("Timed out — no post cards found after all wait selectors")
         log.info("PAGE TITLE: " + driver.title)
         log.info("PAGE SNIPPET: " + driver.page_source[:2000])
-        if "just a moment" in driver.title.lower() or "cloudflare" in driver.title.lower():
-            log.error("Cloudflare block in scrape_listing — triggering redeploy")
-            try:
-                trigger_railway_redeploy()
-            except Exception as _rd_err:
-                log.error(f"Redeploy call failed: {_rd_err}")
         return []
 
     for _ in range(3):
@@ -663,34 +635,6 @@ def run_list_cycle() -> list:
     try:
         driver = build_driver(cookies)
 
-        # ── Warm-up: wait for Cloudflare to clear before hitting discuss pages ─
-        # When cookies expire/change, LeetCode redirects through a Cloudflare
-        # JS challenge on the first request. Navigating to the homepage first
-        # and polling until the challenge clears gives the session time to
-        # establish before we hit the discussion listing pages.
-        log.info("Warm-up: navigating to leetcode.com to establish session")
-        driver.get("https://leetcode.com")
-
-        # Poll up to 15s for Cloudflare to clear
-        for _attempt in range(15):
-            title = driver.title.lower()
-            if "just a moment" in title or "cloudflare" in title:
-                log.info(f"Warm-up: Cloudflare challenge active (attempt {_attempt+1}/15) — waiting 1s")
-                time.sleep(1)
-                # Re-check after each second
-                continue
-            # Page loaded normally
-            log.info(f"Warm-up complete — title: {driver.title!r}")
-            break
-        else:
-            # Still blocked after 15s — trigger redeploy for fresh container
-            log.error("Warm-up: Cloudflare did not clear after 15s — triggering redeploy")
-            trigger_railway_redeploy()
-            raise RuntimeError("Cloudflare block on warm-up — redeploying")
-
-        # Extra settle time for React hydration and cookie propagation
-        time.sleep(3)
-
         log.info(f"Scraping URL1: {LEETCODE_URL_1}")
         raw1 = scrape_listing(driver, LEETCODE_URL_1, max_posts=MAX_POSTS_URL1)
         log.info(f"URL1 returned {len(raw1)} posts")
@@ -745,10 +689,8 @@ def run_list_cycle() -> list:
 # After redeploy, the new container has a clean FD/process table.
 #
 # Required Railway env vars:
-#   RAILWAY_API_TOKEN      — from Railway dashboard → Account → Tokens
-#   RAILWAY_SERVICE_ID     — from Railway dashboard → Service → Settings
-#   RAILWAY_ENVIRONMENT_ID — from Railway dashboard → Service → Settings
-#                            (Railway's API now requires this alongside serviceId)
+#   RAILWAY_API_TOKEN  — from Railway dashboard → Account → Tokens
+#   RAILWAY_SERVICE_ID — from Railway dashboard → Service → Settings
 
 _REDEPLOY_FLAG = "/tmp/.railway_redeploy_triggered"
 
@@ -763,9 +705,8 @@ def trigger_railway_redeploy() -> bool:
         log.info("Auto-redeploy already triggered this session — skipping")
         return False
 
-    api_token      = os.environ.get("RAILWAY_API_TOKEN", "")
-    service_id     = os.environ.get("RAILWAY_SERVICE_ID", "")
-    environment_id = os.environ.get("RAILWAY_ENVIRONMENT_ID", "")
+    api_token  = os.environ.get("RAILWAY_API_TOKEN", "")
+    service_id = os.environ.get("RAILWAY_SERVICE_ID", "")
 
     if not api_token or not service_id:
         log.warning(
@@ -774,19 +715,9 @@ def trigger_railway_redeploy() -> bool:
         )
         return False
 
-    if not environment_id:
-        log.warning(
-            "Auto-redeploy skipped: RAILWAY_ENVIRONMENT_ID not set. "
-            "Railway's API requires this. Add it in Railway env vars "
-            "(Service → Settings → Environment ID)."
-        )
-        return False
-
-    # Railway's serviceInstanceRedeploy mutation requires BOTH serviceId
-    # and environmentId — sending only serviceId returns a 400 error.
     query = """
-    mutation serviceInstanceRedeploy($serviceId: String!, $environmentId: String!) {
-      serviceInstanceRedeploy(serviceId: $serviceId, environmentId: $environmentId)
+    mutation serviceInstanceRedeploy($serviceId: String!) {
+      serviceInstanceRedeploy(serviceId: $serviceId)
     }
     """
     try:
@@ -796,20 +727,10 @@ def trigger_railway_redeploy() -> bool:
                 "Authorization": f"Bearer {api_token}",
                 "Content-Type":  "application/json",
             },
-            json={
-                "query": query,
-                "variables": {
-                    "serviceId":     service_id,
-                    "environmentId": environment_id,
-                },
-            },
+            json={"query": query, "variables": {"serviceId": service_id}},
             timeout=15,
         )
         if resp.ok:
-            data = resp.json()
-            if data.get("errors"):
-                log.error(f"Railway redeploy GraphQL errors: {data['errors']}")
-                return False
             open(_REDEPLOY_FLAG, "w").write("1")   # set one-shot flag
             log.info(f"🔄 Railway auto-redeploy triggered (service={service_id})")
             return True
