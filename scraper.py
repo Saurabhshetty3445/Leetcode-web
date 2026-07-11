@@ -706,22 +706,32 @@ def run_list_cycle() -> list:
         # fully establish before scraping the actual listing pages.
         log.info("Warm-up: navigating to leetcode.com to establish session")
         driver.get("https://leetcode.com")
+        time.sleep(2)   # initial pause so Cloudflare JS challenge can start executing
 
-        for _attempt in range(15):
+        cf_cleared = False
+        for _attempt in range(30):   # poll up to 30s
             title = driver.title.lower()
             if "just a moment" in title or "cloudflare" in title:
-                log.info(f"Warm-up: Cloudflare challenge active (attempt {_attempt+1}/15) — waiting 1s")
+                if _attempt == 0:
+                    log.info("Warm-up: Cloudflare challenge detected — waiting for JS to resolve")
+                elif _attempt % 5 == 0:
+                    log.info(f"Warm-up: still waiting for Cloudflare ({_attempt}s elapsed)...")
                 time.sleep(1)
                 continue
-            log.info(f"Warm-up complete — title: {driver.title!r}")
+            log.info(f"Warm-up complete after {_attempt}s — title: {driver.title!r}")
+            cf_cleared = True
             break
-        else:
-            log.error("Warm-up: Cloudflare did not clear after 15s — triggering redeploy")
+
+        if not cf_cleared:
+            # Challenge did not clear in 30s — trigger redeploy but DO NOT raise.
+            # Raising crashes the whole pipeline; instead return [] so the
+            # scheduler can try again cleanly on the next 4-hour cycle.
+            log.error("Warm-up: Cloudflare did not clear after 30s — triggering redeploy and skipping run")
             trigger_railway_redeploy()
-            raise RuntimeError("Cloudflare block on warm-up — redeploying")
+            return []
 
         # Extra settle time for React hydration and cookie propagation
-        time.sleep(3)
+        time.sleep(4)
 
         log.info(f"Scraping URL1: {LEETCODE_URL_1}")
         raw1 = scrape_listing(driver, LEETCODE_URL_1, max_posts=MAX_POSTS_URL1)
@@ -738,22 +748,26 @@ def run_list_cycle() -> list:
         # zero posts and the page title shows a Cloudflare challenge, wait for
         # it to clear and retry URL2 once before giving up.
         if not raw2 and ("just a moment" in driver.title.lower() or "cloudflare" in driver.title.lower()):
-            log.warning("URL2 hit Cloudflare — re-warming and retrying once")
-            for _attempt in range(15):
+            log.warning("URL2 hit Cloudflare — navigating to homepage to resolve challenge then retrying")
+            # Navigate back to homepage so Cloudflare's JS challenge can execute
+            driver.get("https://leetcode.com")
+            time.sleep(2)
+            cf2_cleared = False
+            for _attempt in range(20):
                 title = driver.title.lower()
                 if "just a moment" in title or "cloudflare" in title:
-                    log.info(f"URL2 retry warm-up: challenge active (attempt {_attempt+1}/15) — waiting 1s")
                     time.sleep(1)
                     continue
-                log.info(f"URL2 retry warm-up complete — title: {driver.title!r}")
+                log.info(f"URL2 re-warm complete after {_attempt}s — retrying URL2")
+                cf2_cleared = True
                 break
+            if cf2_cleared:
+                time.sleep(3)
+                log.info(f"Retrying URL2: {LEETCODE_URL_2}")
+                raw2 = scrape_listing(driver, LEETCODE_URL_2, max_posts=MAX_POSTS_URL2)
+                log.info(f"URL2 retry returned {len(raw2)} posts")
             else:
-                log.warning("URL2 retry warm-up: Cloudflare did not clear after 15s — skipping retry")
-
-            time.sleep(2)
-            log.info(f"Retrying URL2: {LEETCODE_URL_2}")
-            raw2 = scrape_listing(driver, LEETCODE_URL_2, max_posts=MAX_POSTS_URL2)
-            log.info(f"URL2 retry returned {len(raw2)} posts")
+                log.warning("URL2 re-warm: Cloudflare did not clear after 20s — using URL1 results only")
 
         seen_urls = set()
         combined  = []
