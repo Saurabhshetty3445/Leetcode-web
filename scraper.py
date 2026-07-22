@@ -706,32 +706,22 @@ def run_list_cycle() -> list:
         # fully establish before scraping the actual listing pages.
         log.info("Warm-up: navigating to leetcode.com to establish session")
         driver.get("https://leetcode.com")
-        time.sleep(2)   # initial pause so Cloudflare JS challenge can start executing
 
-        cf_cleared = False
-        for _attempt in range(30):   # poll up to 30s
+        for _attempt in range(15):
             title = driver.title.lower()
             if "just a moment" in title or "cloudflare" in title:
-                if _attempt == 0:
-                    log.info("Warm-up: Cloudflare challenge detected — waiting for JS to resolve")
-                elif _attempt % 5 == 0:
-                    log.info(f"Warm-up: still waiting for Cloudflare ({_attempt}s elapsed)...")
+                log.info(f"Warm-up: Cloudflare challenge active (attempt {_attempt+1}/15) — waiting 1s")
                 time.sleep(1)
                 continue
-            log.info(f"Warm-up complete after {_attempt}s — title: {driver.title!r}")
-            cf_cleared = True
+            log.info(f"Warm-up complete — title: {driver.title!r}")
             break
-
-        if not cf_cleared:
-            # Challenge did not clear in 30s — trigger redeploy but DO NOT raise.
-            # Raising crashes the whole pipeline; instead return [] so the
-            # scheduler can try again cleanly on the next 4-hour cycle.
-            log.error("Warm-up: Cloudflare did not clear after 30s — triggering redeploy and skipping run")
+        else:
+            log.error("Warm-up: Cloudflare did not clear after 15s — triggering redeploy")
             trigger_railway_redeploy()
-            return []
+            raise RuntimeError("Cloudflare block on warm-up — redeploying")
 
         # Extra settle time for React hydration and cookie propagation
-        time.sleep(4)
+        time.sleep(3)
 
         log.info(f"Scraping URL1: {LEETCODE_URL_1}")
         raw1 = scrape_listing(driver, LEETCODE_URL_1, max_posts=MAX_POSTS_URL1)
@@ -748,26 +738,22 @@ def run_list_cycle() -> list:
         # zero posts and the page title shows a Cloudflare challenge, wait for
         # it to clear and retry URL2 once before giving up.
         if not raw2 and ("just a moment" in driver.title.lower() or "cloudflare" in driver.title.lower()):
-            log.warning("URL2 hit Cloudflare — navigating to homepage to resolve challenge then retrying")
-            # Navigate back to homepage so Cloudflare's JS challenge can execute
-            driver.get("https://leetcode.com")
-            time.sleep(2)
-            cf2_cleared = False
-            for _attempt in range(20):
+            log.warning("URL2 hit Cloudflare — re-warming and retrying once")
+            for _attempt in range(15):
                 title = driver.title.lower()
                 if "just a moment" in title or "cloudflare" in title:
+                    log.info(f"URL2 retry warm-up: challenge active (attempt {_attempt+1}/15) — waiting 1s")
                     time.sleep(1)
                     continue
-                log.info(f"URL2 re-warm complete after {_attempt}s — retrying URL2")
-                cf2_cleared = True
+                log.info(f"URL2 retry warm-up complete — title: {driver.title!r}")
                 break
-            if cf2_cleared:
-                time.sleep(3)
-                log.info(f"Retrying URL2: {LEETCODE_URL_2}")
-                raw2 = scrape_listing(driver, LEETCODE_URL_2, max_posts=MAX_POSTS_URL2)
-                log.info(f"URL2 retry returned {len(raw2)} posts")
             else:
-                log.warning("URL2 re-warm: Cloudflare did not clear after 20s — using URL1 results only")
+                log.warning("URL2 retry warm-up: Cloudflare did not clear after 15s — skipping retry")
+
+            time.sleep(2)
+            log.info(f"Retrying URL2: {LEETCODE_URL_2}")
+            raw2 = scrape_listing(driver, LEETCODE_URL_2, max_posts=MAX_POSTS_URL2)
+            log.info(f"URL2 retry returned {len(raw2)} posts")
 
         seen_urls = set()
         combined  = []
@@ -798,11 +784,38 @@ def run_list_cycle() -> list:
         log.info(f"List cycle done — {len(posts)} combined posts")
 
     except Exception as e:
+        err_msg = str(e).lower()
+        # Renderer crash / storage timeout — Chrome died mid-run (OOM after
+        # long uptime). Trigger one redeploy to get a fresh container, then
+        # return [] so the pipeline exits cleanly instead of crashing.
+        _RENDERER_SIGNALS = [
+            "timed out receiving message from renderer",
+            "session not created",
+            "chrome not reachable",
+            "no such session",
+            "invalid session id",
+            "target window already closed",
+            "errno 11",
+            "resource temporarily unavailable",
+            "blockingioerror",
+            "storage full",
+            "device or resource busy",
+        ]
+        if any(sig in err_msg for sig in _RENDERER_SIGNALS):
+            log.error(f"Renderer/storage crash in list cycle: {e} — triggering redeploy")
+            try:
+                trigger_railway_redeploy()
+            except Exception as _rd:
+                log.error(f"Redeploy call failed: {_rd}")
+            return []
         log.exception(f"List cycle crashed: {e}")
         raise
     finally:
         if driver:
-            driver.quit()
+            try:
+                driver.quit()
+            except Exception:
+                pass
 
     return posts
 
