@@ -1,4 +1,4 @@
-"""
+        """
 workflow.py — Core pipeline: list → dedupe → scrape → clean → AI → describe → store.
 
 This module is the heart of the system. It is:
@@ -20,6 +20,7 @@ from gemini_client import extract_problems
 from gemini_description import enrich_with_descriptions
 from parser import parse_gemini_output
 import supabase_client as db
+from leetcode_url_finder import find_leetcode_problem_url
 
 log = get_logger("workflow")
 
@@ -116,25 +117,21 @@ def _store_results(
     post_url:  str,
     timestamp: str,
     problems:  list[dict],
-) -> None:
+) -> list[tuple]:
     """
     Router logic:
-      CASE A — no problems → insert only into post_ids
+      CASE A — no problems → insert only into post_ids, return []
       CASE B — problems found →
-          1. Insert each into problems (sequential, preserves company ordering)
-          2. Upsert the company into companies table
-          3. Insert into company_problems (links company ↔ problem)
-          4. Insert post_id last (marks post as fully processed)
-
-    The description field on each problem dict is populated by
-    enrich_with_descriptions() before this function is called.
-    The DB trigger fn_sync_company_problem also handles step 2+3
-    automatically, but we call it explicitly here for reliability.
+          1. Insert each into problems
+          2. Upsert company, insert into company_problems
+          3. Insert post_id last
+          4. Return list of (problem_id, company_problem_id, search_keyword)
+             so the caller can look up and store LeetCode problem URLs.
     """
     if _is_no_problems(problems):
         log.info(f"[CASE A] No problems — recording post_id only: {post_id}")
         db.insert_post_id(post_id, post_url, timestamp)
-        return
+        return []
 
     log.info(f"[CASE B] {len(problems)} problem(s) found — inserting to problems + company_problems")
     inserted_problems: list[tuple] = []   # (problem_id, problem_dict)
@@ -155,7 +152,8 @@ def _store_results(
         except Exception as e:
             log.error(f"Failed to insert problem {p}: {e}")
 
-    # For each successfully inserted problem, sync to company_problems
+    # For each inserted problem, sync to company_problems and collect IDs
+    stored: list[tuple] = []   # (problem_id, company_problem_id, search_keyword)
     for problem_id, p in inserted_problems:
         company_name = p.get("company", "").strip()
         if not company_name:
@@ -163,7 +161,7 @@ def _store_results(
         try:
             company_id = db.upsert_company(company_name)
             if company_id:
-                db.insert_company_problem(
+                cp_id = db.insert_company_problem_returning_id(
                     company_id   = company_id,
                     problem_id   = problem_id,
                     company_name = company_name,
@@ -174,11 +172,17 @@ def _store_results(
                     post_url     = post_url,
                     problem_url  = None,
                 )
+                stored.append((
+                    problem_id,
+                    cp_id,
+                    p.get("search_keyword", "").strip(),
+                ))
         except Exception as e:
             log.error(f"Failed to sync company_problems for {p.get('problem_name')!r}: {e}")
 
     # Only record post_id AFTER all problems are safely stored
     db.insert_post_id(post_id, post_url, timestamp)
+    return stored
 
 
 # ── Main pipeline ─────────────────────────────────────────────────────────────
@@ -204,6 +208,7 @@ def run_pipeline(list_fn, scrape_fn) -> dict:
         "gemini_fail":      0,
         "problems_total":   0,
         "descriptions_ok":  0,
+        "problem_urls_found": 0,
         "db_inserts":       0,
         "errors":           [],
     }
@@ -326,12 +331,33 @@ def run_pipeline(list_fn, scrape_fn) -> dict:
 
             # ── STEP 7: route + store ─────────────────────────────────────────
             log.info("STEP 7 — Storing results")
+            stored_ids = []
             try:
-                _store_results(post_id, post_url, timestamp, problems)
+                stored_ids = _store_results(post_id, post_url, timestamp, problems)
                 summary["db_inserts"] += 1
             except Exception as e:
                 log.error(f"DB store failed for {post_id}: {e}")
                 summary["errors"].append(f"db_fail:{post_id}")
+
+            # ── STEP 8: LeetCode problem URL lookup ───────────────────────────
+            if stored_ids:
+                log.info(f"STEP 8 — Looking up LeetCode URLs for {len(stored_ids)} problem(s)")
+                for problem_id, cp_id, search_keyword in stored_ids:
+                    if not search_keyword:
+                        log.info(f"STEP 8 — No keyword for problem_id={problem_id}, skipping")
+                        continue
+                    log.info(f"STEP 8 — Searching LeetCode: '{search_keyword}'")
+                    try:
+                        problem_url = find_leetcode_problem_url(driver, search_keyword)
+                        if problem_url:
+                            db.update_problem_url(problem_id, cp_id, problem_url)
+                            summary["problem_urls_found"] += 1
+                            log.info(f"STEP 8 — URL found and saved: {problem_url}")
+                        else:
+                            log.info(f"STEP 8 — No URL found for '{search_keyword}' — skipping")
+                    except Exception as e:
+                        log.error(f"STEP 8 — URL lookup failed for '{search_keyword}': {e}")
+                    time.sleep(1)   # polite delay between searches
 
             time.sleep(SCRAPE_DELAY)
 
@@ -347,6 +373,7 @@ def run_pipeline(list_fn, scrape_fn) -> dict:
         f"Skipped={summary['skipped']} | Scraped OK={summary['scraped_ok']} | "
         f"Gemini OK={summary['gemini_ok']} | Problems={summary['problems_total']} | "
         f"Descriptions={summary['descriptions_ok']} | "
+        f"Problem URLs={summary['problem_urls_found']} | "
         f"DB inserts={summary['db_inserts']} | Errors={len(summary['errors'])}"
     )
     return summary
