@@ -96,14 +96,6 @@ def build_driver(cookies: Optional[list] = None) -> webdriver.Chrome:
     # Turnstile challenge checks if images actually load; disabling them
     # is a strong bot signal that contributes to session invalidation.
 
-    # 🔥 MEMORY LIMITS for e2-micro (1GB RAM) — prevents tab crashes
-    opts.add_argument("--js-flags=--max-old-space-size=256")
-    opts.add_argument("--aggressive-cache-discard")
-    opts.add_argument("--disable-cache")
-    opts.add_argument("--disable-application-cache")
-    opts.add_argument("--media-cache-size=0")
-    opts.add_argument("--disk-cache-size=0")
-
     # 🔥 FINGERPRINT HARDENING — these directly target Cloudflare's bot checks
     opts.add_argument("--disable-blink-features=AutomationControlled")
     opts.add_argument("--lang=en-US,en")
