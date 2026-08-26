@@ -1,4 +1,4 @@
-        """
+"""
 workflow.py — Core pipeline: list → dedupe → scrape → clean → AI → describe → store.
 
 This module is the heart of the system. It is:
@@ -20,7 +20,6 @@ from gemini_client import extract_problems
 from gemini_description import enrich_with_descriptions
 from parser import parse_gemini_output
 import supabase_client as db
-from leetcode_url_finder import find_leetcode_problem_url
 
 log = get_logger("workflow")
 
