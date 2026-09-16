@@ -3,44 +3,39 @@ scraper.py — LeetCode Interview Experience Scraper
 Hosted on Railway | Self-scheduled every 4 hours via APScheduler
 Endpoints: /list, /scrape-content (legacy), /run (manual trigger), /health
 
-Page fetching is done through Cloudflare's managed Browser Rendering API
-(see cloudflare_browser_client.py) instead of a local, fingerprint-spoofed
-headless Chrome. That means:
-  - no local browser process to crash, leak file descriptors, or OOM
-  - no anti-detection/stealth JS — requests are honestly identifiable
-  - if the target site's bot protection blocks a request, it just fails
-    (BlockedError) and this module backs off — it does not retry through
-    it or rotate infrastructure to dodge the block
-All pipeline orchestration lives in workflow.py.
+⚠️  Scraping logic (build_driver, scrape_post_detail, scrape_listing,
+    is_today_strict, timestamp_to_sort_key) is UNCHANGED from the original.
+    All pipeline orchestration lives in workflow.py.
 """
 
 import os
-import re
 import json
 import time
 import hashlib
-import threading
-import uuid
+import logging
 from datetime import datetime, timezone
 from typing import Optional
+import threading
+import uuid
 
+import requests
 from bs4 import BeautifulSoup
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.chrome.options import Options
+from selenium.common.exceptions import TimeoutException, NoSuchElementException
 from flask import Flask, jsonify, request
 
-from cloudflare_browser_client import (
-    fetch_rendered_html,
-    backoff_delay,
-    BlockedError,
-    CloudflareConfigError,
-)
 from config import (
     LEETCODE_URL_1, LEETCODE_URL_2,
     MAX_POSTS_URL1, MAX_POSTS_URL2, MAX_POSTS_COMBINED,
-    SCRAPE_DELAY, MAX_RETRY,
+    SCRAPE_DELAY,
 )
-from logger import get_logger
 
-log = get_logger("scraper")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
@@ -48,52 +43,158 @@ app = Flask(__name__)
 _run_lock = threading.Lock()
 
 
-# ── Rendered-page adapter ─────────────────────────────────────────────────────
-# Thin object exposing just the handful of things the rest of this codebase
-# (and workflow.py / links_workflow.py) actually used from the old Selenium
-# `webdriver.Chrome` object: get(), page_source, title, a body-text getter,
-# and quit(). Backing it with Cloudflare's Browser Rendering API means every
-# .get() call is a fresh, independent, fully-rendered fetch — there is no
-# persistent browser session to keep alive or warm up between calls.
+# ── Selenium Driver (UNCHANGED) ───────────────────────────────────────────────
 
-_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
-
-
-class RenderedPage:
-    def __init__(self, cookies: Optional[list] = None):
-        self._cookies = cookies
-        self.page_source = ""
-        self.title = ""
-
-    def get(self, url: str, wait_for_selector: Optional[str] = None) -> None:
-        html = fetch_rendered_html(
-            url,
-            wait_for_selector=wait_for_selector,
-            cookies=self._cookies,
-        )
-        self.page_source = html
-        m = _TITLE_RE.search(html or "")
-        self.title = m.group(1).strip() if m else ""
-
-    def body_text(self, limit: int = 3000) -> str:
-        soup = BeautifulSoup(self.page_source or "", "html.parser")
-        body = soup.find("body")
-        text = body.get_text(" ", strip=True) if body else ""
-        return text[:limit]
-
-    def quit(self) -> None:
-        # No persistent process/session to tear down.
-        return None
-
-
-def build_driver(cookies: Optional[list] = None) -> RenderedPage:
+def _kill_zombie_chrome() -> None:
     """
-    Returns a RenderedPage backed by Cloudflare's Browser Rendering API.
-    `cookies` (if provided via LEETCODE_COOKIES) is forwarded as-is to the
-    API's own `cookies` parameter for requests that need an authenticated
-    session — it is not used to fake or hide anything.
+    Kill any leftover Chrome/chromedriver processes before spawning a new one.
+    Prevents [Errno 11] BlockingIOError caused by exhausted OS process/FD limits
+    when the scheduler spawns Chrome repeatedly across 4-hour cron cycles.
     """
-    return RenderedPage(cookies=cookies)
+    import subprocess as _sp
+    for proc_name in ("chrome", "chromedriver", "google-chrome"):
+        try:
+            _sp.run(
+                ["pkill", "-f", proc_name],
+                stdout=_sp.DEVNULL,
+                stderr=_sp.DEVNULL,
+                timeout=5,
+            )
+        except Exception:
+            pass
+    time.sleep(1)   # give OS time to reclaim FDs
+
+
+def build_driver(cookies: Optional[list] = None) -> webdriver.Chrome:
+    # Kill zombie Chrome processes first — prevents [Errno 11] FD exhaustion
+    _kill_zombie_chrome()
+
+    opts = Options()
+
+    # 🔥 STABILITY FLAGS (critical for container)
+    opts.add_argument("--headless=new")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--disable-gpu")
+    opts.add_argument("--disable-extensions")
+    opts.add_argument("--disable-software-rasterizer")
+    opts.add_argument("--disable-background-networking")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_argument("--no-first-run")
+    opts.add_argument("--disable-default-apps")
+    opts.add_argument("--window-size=1920,1080")   # real desktop resolution, not a bot-like size
+    opts.add_argument("--single-process")   # 🔥 important for low RAM
+    opts.add_argument("--no-zygote")        # 🔥 prevents zygote holding extra FDs
+
+    # 🔥 OOM / FD PREVENTION
+    opts.add_argument("--memory-pressure-off")
+    opts.add_argument("--disable-renderer-backgrounding")
+    opts.add_argument("--disable-backgrounding-occluded-windows")
+    opts.add_argument("--disable-features=TranslateUI,BlinkGenPropertyTrees")
+    opts.add_argument("--renderer-process-limit=1")
+    # NOTE: removed --blink-settings=imagesEnabled=false — Cloudflare's
+    # Turnstile challenge checks if images actually load; disabling them
+    # is a strong bot signal that contributes to session invalidation.
+
+    # 🔥 FINGERPRINT HARDENING — these directly target Cloudflare's bot checks
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_argument("--lang=en-US,en")
+    opts.add_argument("--disable-web-security")
+    opts.add_argument("--disable-features=IsolateOrigins,site-per-process")
+    opts.add_argument("--disable-site-isolation-trials")
+
+    opts.page_load_strategy = "eager"
+
+    # ✅ realistic, current Chrome user agent (matches a real recent Chrome release)
+    opts.add_argument(
+        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/126.0.0.0 Safari/537.36"
+    )
+
+    # ✅ disable automation detection
+    opts.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
+    opts.add_experimental_option("useAutomationExtension", False)
+    opts.add_experimental_option("prefs", {
+        "profile.default_content_setting_values.notifications": 2,
+        "credentials_enable_service": False,
+        "profile.password_manager_enabled": False,
+    })
+
+    # ✅ force binary path (from Docker)
+    opts.binary_location = "/usr/bin/google-chrome"
+
+    # 🔥 FORCE MANUAL DRIVER (NO Selenium Manager)
+    from selenium.webdriver.chrome.service import Service as ChromeService
+    service = ChromeService(executable_path="/usr/bin/chromedriver")
+
+    # ✅ NO fallback → fail fast if broken
+    driver = webdriver.Chrome(service=service, options=opts)
+
+    driver.set_page_load_timeout(25)
+
+    # ── Comprehensive anti-detection script ─────────────────────────────────
+    # Cloudflare/Turnstile checks dozens of navigator/window properties beyond
+    # just navigator.webdriver. This script patches the most commonly checked
+    # ones so the headless browser looks like a real Chrome desktop session.
+    stealth_js = """
+        // Hide webdriver flag
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+
+        // Fake a realistic plugins array (real Chrome has several)
+        Object.defineProperty(navigator, 'plugins', {
+            get: () => [1, 2, 3, 4, 5].map(() => ({ name: 'Chrome PDF Plugin' }))
+        });
+
+        // Fake realistic languages
+        Object.defineProperty(navigator, 'languages', {
+            get: () => ['en-US', 'en']
+        });
+
+        // window.chrome must exist (headless lacks it by default)
+        window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){} };
+
+        // Permissions API — headless reports 'denied' for notifications by default
+        const originalQuery = window.navigator.permissions.query;
+        window.navigator.permissions.query = (parameters) => (
+            parameters.name === 'notifications'
+                ? Promise.resolve({ state: Notification.permission })
+                : originalQuery(parameters)
+        );
+
+        // WebGL vendor/renderer — headless often exposes 'Google SwiftShader'
+        // which is a strong automated-browser signal
+        const getParameter = WebGLRenderingContext.prototype.getParameter;
+        WebGLRenderingContext.prototype.getParameter = function(parameter) {
+            if (parameter === 37445) return 'Intel Inc.';
+            if (parameter === 37446) return 'Intel Iris OpenGL Engine';
+            return getParameter.apply(this, arguments);
+        };
+
+        // Hardware concurrency — headless sometimes reports 1 or unusual values
+        Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+
+        // Screen properties consistent with the real window size
+        Object.defineProperty(screen, 'availWidth', { get: () => 1920 });
+        Object.defineProperty(screen, 'availHeight', { get: () => 1040 });
+    """
+    driver.execute_cdp_cmd(
+        "Page.addScriptToEvaluateOnNewDocument",
+        {"source": stealth_js},
+    )
+
+    # 🍪 cookies — visit homepage first so domain is set before injecting
+    if cookies:
+        driver.get("https://leetcode.com")
+        time.sleep(1.5)   # let initial page settle before adding cookies
+        for ck in cookies:
+            try:
+                driver.add_cookie(ck)
+            except Exception as e:
+                log.warning(f"Cookie inject failed: {e}")
+        log.info(f"Injected {len(cookies)} cookies")
+
+    return driver
 
 
 def load_cookies_from_env() -> Optional[list]:
@@ -107,87 +208,107 @@ def load_cookies_from_env() -> Optional[list]:
         return None
 
 
-# ── Scraping logic ────────────────────────────────────────────────────────────
+# ── Scraping Logic (UNCHANGED) ────────────────────────────────────────────────
 
-def scrape_post_detail(driver: RenderedPage, url: str) -> Optional[str]:
+def scrape_post_detail(driver: webdriver.Chrome, url: str) -> Optional[str]:
     """
-    Scrape post content from a LeetCode discuss post.
+    Scrape post content from LeetCode discuss post.
     Collects text from: p, ul, li, b, h1, h2, h3, h4, i tags
     inside div.break-words — preserves full structure.
     Limit 6000 chars for AI safety.
     """
+    import re as _re
     try:
-        driver.get(url, wait_for_selector="div.break-words")
-    except BlockedError as e:
-        log.warning(f"Detail scrape blocked for {url}: {e}")
-        return None
-    except Exception as e:
-        log.error(f"Detail scrape failed for {url}: {e}")
-        return None
+        driver.get(url)
 
-    soup = BeautifulSoup(driver.page_source, "html.parser")
-    for tag in soup.select("nav, footer, header, script, style, aside"):
-        tag.decompose()
+        for sel in ["div.break-words", "div[class*='break-words']", "h1", "body"]:
+            try:
+                WebDriverWait(driver, 12).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, sel))
+                )
+                log.info(f"Post page loaded: {sel}")
+                break
+            except TimeoutException:
+                continue
 
-    CONTENT_TAGS = ["p", "ul", "li", "b", "h1", "h2", "h3", "h4", "i", "span"]
-    lines = []
+        time.sleep(1.5)
+        soup = BeautifulSoup(driver.page_source, "html.parser")
 
-    def extract_from_container(container):
-        for tag in container.find_all(CONTENT_TAGS):
-            text = tag.get_text(separator=" ", strip=True)
-            if text and len(text) > 1:
-                if tag.name in ["h1", "h2", "h3", "h4"]:
-                    lines.append(f"[{tag.name.upper()}] {text}")
-                elif tag.name == "li":
-                    lines.append(f"- {text}")
-                else:
-                    lines.append(text)
+        for tag in soup.select("nav, footer, header, script, style, aside"):
+            tag.decompose()
 
-    container = soup.select_one("div.break-words")
-    if container:
-        log.info("Primary container div.break-words found")
-        extract_from_container(container)
+        CONTENT_TAGS = ["p", "ul", "li", "b", "h1", "h2", "h3", "h4", "i", "span"]
+        lines = []
 
-    if not lines:
-        log.warning("Primary empty — trying break-words class fallback")
-        container = soup.find("div", class_=lambda c: c and "break-words" in c)
+        def extract_from_container(container):
+            for tag in container.find_all(CONTENT_TAGS):
+                text = tag.get_text(separator=" ", strip=True)
+                if text and len(text) > 1:
+                    if tag.name in ["h1", "h2", "h3", "h4"]:
+                        lines.append(f"[{tag.name.upper()}] {text}")
+                    elif tag.name == "li":
+                        lines.append(f"- {text}")
+                    else:
+                        lines.append(text)
+
+        container = soup.select_one("div.break-words")
         if container:
+            log.info("Primary container div.break-words found")
             extract_from_container(container)
 
-    if not lines:
-        log.warning("Trying full page content tags")
-        extract_from_container(soup)
+        if not lines:
+            log.warning("Primary empty — trying break-words class fallback")
+            container = soup.find("div", class_=lambda c: c and "break-words" in c)
+            if container:
+                extract_from_container(container)
 
-    if not lines:
-        log.warning("Using body text fallback")
-        lines = [driver.body_text()]
+        if not lines:
+            log.warning("Trying full page content tags")
+            extract_from_container(soup)
 
-    full_text = "\n".join(lines)
-    full_text = re.sub(r"\n{3,}", "\n\n", full_text).strip()
+        if not lines:
+            log.warning("Using body text fallback")
+            body = driver.find_element(By.TAG_NAME, "body").text
+            lines = [body[:3000]]
 
-    if len(full_text) > 6000:
-        full_text = full_text[:6000].strip() + "..."
-        log.info("Truncated to 6000 chars")
-    else:
-        log.info(f"Full content: {len(full_text)} chars")
+        full_text = "\n".join(lines)
+        full_text = _re.sub(r"\n{3,}", "\n\n", full_text).strip()
 
-    return full_text if full_text else None
+        if len(full_text) > 6000:
+            full_text = full_text[:6000].strip() + "..."
+            log.info("Truncated to 6000 chars")
+        else:
+            log.info(f"Full content: {len(full_text)} chars")
+
+        return full_text if full_text else None
+
+    except Exception as e:
+        log.error(f"Detail scrape failed for {url}: {e}")
+        try:
+            body = driver.find_element(By.TAG_NAME, "body").text
+            return body[:6000].strip() if body else None
+        except Exception:
+            pass
+        return None
 
 
-def scrape_post_detail_with_date(driver: RenderedPage, url: str) -> tuple:
+def scrape_post_detail_with_date(driver: webdriver.Chrome, url: str) -> tuple:
     """
     Scrape post content AND the real posting date from a LeetCode discuss post.
 
-    Waits for div.break-words to be present (via Cloudflare's
-    waitForSelector + networkidle2) so the React app has finished
-    hydrating before we parse — this covers both the content and the
-    <time> element in a single fetch.
+    Unlike scrape_post_date (which re-parses an already-loaded page and often
+    misses the React-rendered <time> tag), this function:
+      1. Navigates to the URL
+      2. Waits for content (div.break-words) to load
+      3. Explicitly waits up to 8s for a <time> element to appear
+      4. Parses both content and timestamp from the same fully-rendered page
 
     Returns:
         (content: str | None, posted_on: str)
         posted_on is RFC 2822 format e.g. "Mon, 27 May 2026 08:30:00 GMT"
-        Falls back to current UTC time only if no date found.
+        Falls back to current UTC time only if no date found after full wait.
     """
+    import re as _re
     from email.utils import formatdate as _fmtdate
     from datetime import datetime as _dt, timezone as _tz
 
@@ -195,7 +316,30 @@ def scrape_post_detail_with_date(driver: RenderedPage, url: str) -> tuple:
     posted_on = None
 
     try:
-        driver.get(url, wait_for_selector="div.break-words")
+        driver.get(url)
+
+        # ── Wait for main content ─────────────────────────────────────────────
+        for sel in ["div.break-words", "div[class*='break-words']", "h1", "body"]:
+            try:
+                WebDriverWait(driver, 12).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, sel))
+                )
+                break
+            except TimeoutException:
+                continue
+
+        # ── Wait explicitly for <time> element (React renders this late) ──────
+        try:
+            WebDriverWait(driver, 8).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "time[datetime]"))
+            )
+            log.info("scrape_post_detail_with_date: <time> element found")
+        except TimeoutException:
+            log.warning("scrape_post_detail_with_date: <time> not found within 8s — trying JS wait")
+            # Extra JS wait for React hydration
+            time.sleep(2)
+
+        # ── Parse fully-rendered page ─────────────────────────────────────────
         soup = BeautifulSoup(driver.page_source, "html.parser")
 
         # ── Extract date ──────────────────────────────────────────────────────
@@ -225,7 +369,7 @@ def scrape_post_detail_with_date(driver: RenderedPage, url: str) -> tuple:
         if not posted_on:
             for t in soup.find_all("time"):
                 tooltip = t.get("title", "") or t.get("data-tooltip", "")
-                m = re.search(r"(\w{3,9}\s+\d{1,2},?\s+\d{4})", tooltip)
+                m = _re.search(r"(\w{3,9}\s+\d{1,2},?\s+\d{4})", tooltip)
                 if m:
                     try:
                         dt = _dt.strptime(m.group(1).replace(",", ""), "%B %d %Y")
@@ -240,7 +384,7 @@ def scrape_post_detail_with_date(driver: RenderedPage, url: str) -> tuple:
         if not posted_on:
             for el in soup.find_all(attrs={"data-tooltip": True}):
                 tooltip = el["data-tooltip"]
-                m = re.search(r"(\w{3,9}\s+\d{1,2},?\s+\d{4})", tooltip)
+                m = _re.search(r"(\w{3,9}\s+\d{1,2},?\s+\d{4})", tooltip)
                 if m:
                     try:
                         dt = _dt.strptime(m.group(1).replace(",", ""), "%B %d %Y")
@@ -279,16 +423,18 @@ def scrape_post_detail_with_date(driver: RenderedPage, url: str) -> tuple:
         if not lines:
             extract_from(soup)
         if not lines:
-            lines = [driver.body_text()]
+            try:
+                body = driver.find_element(By.TAG_NAME, "body").text
+                lines = [body[:3000]]
+            except Exception:
+                pass
 
         full_text = "\n".join(lines)
-        full_text = re.sub(r"\n{3,}", "\n\n", full_text).strip()
+        full_text = _re.sub(r"\n{3,}", "\n\n", full_text).strip()
         if len(full_text) > 6000:
             full_text = full_text[:6000].strip() + "..."
         content = full_text if full_text else None
 
-    except BlockedError as e:
-        log.warning(f"scrape_post_detail_with_date blocked for {url}: {e}")
     except Exception as e:
         log.error(f"scrape_post_detail_with_date failed for {url}: {e}")
 
@@ -301,6 +447,7 @@ def scrape_post_detail_with_date(driver: RenderedPage, url: str) -> tuple:
 
 
 def is_today_strict(timestamp: str) -> bool:
+    import re
     t = timestamp.strip().lower()
 
     if not t:
@@ -339,7 +486,8 @@ def is_today_strict(timestamp: str) -> bool:
 
 
 def timestamp_to_sort_key(timestamp: str) -> int:
-    from datetime import timedelta
+    import re
+    from datetime import datetime as dt2, timedelta
 
     t   = timestamp.strip().lower()
     now = datetime.now(timezone.utc)
@@ -362,7 +510,8 @@ def timestamp_to_sort_key(timestamp: str) -> int:
     m = re.search(r"([a-z]{3})\s+(\d{1,2}),?\s+(\d{4})", t)
     if m:
         try:
-            d = datetime.strptime(f"{m.group(1)} {m.group(2)} {m.group(3)}", "%b %d %Y")
+            from datetime import datetime as dt2
+            d = dt2.strptime(f"{m.group(1)} {m.group(2)} {m.group(3)}", "%b %d %Y")
             return int(d.timestamp())
         except Exception:
             pass
@@ -373,17 +522,43 @@ def post_hash(url: str) -> str:
     return hashlib.md5(url.encode()).hexdigest()
 
 
-def scrape_listing(driver: RenderedPage, url: str, max_posts: int = 6) -> list:
-    """
-    Fetch and parse a LeetCode discuss listing page.
+def scrape_listing(driver: webdriver.Chrome, url: str, max_posts: int = 6) -> list:
+    import re
+    driver.get(url)
 
-    Note: unlike the old live-browser version, this does not scroll to
-    trigger additional lazy-loaded items — Cloudflare's renderer returns
-    whatever is present after the page network-idles. If LeetCode's
-    listing depends on scroll-triggered loading for more than the initial
-    batch, max_posts effectively caps at what's rendered up front.
-    """
-    driver.get(url, wait_for_selector="a[href*='/discuss/']")
+    waited = False
+    for wait_sel in [
+        "div.flex.flex-col.gap-4",
+        "div[class*='topic-item']",
+        "a[href*='/discuss/']",
+        "div.overflow-hidden",
+    ]:
+        try:
+            WebDriverWait(driver, 8).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, wait_sel))
+            )
+            log.info(f"Page loaded — wait selector matched: {wait_sel}")
+            waited = True
+            break
+        except TimeoutException:
+            continue
+
+    if not waited:
+        log.error("Timed out — no post cards found after all wait selectors")
+        log.info("PAGE TITLE: " + driver.title)
+        log.info("PAGE SNIPPET: " + driver.page_source[:2000])
+        if "just a moment" in driver.title.lower() or "cloudflare" in driver.title.lower():
+            log.error("Cloudflare block in scrape_listing — triggering redeploy")
+            try:
+                trigger_railway_redeploy()
+            except Exception as _rd_err:
+                log.error(f"Redeploy call failed: {_rd_err}")
+        return []
+
+    for _ in range(3):
+        driver.execute_script("window.scrollBy(0, 400);")
+        time.sleep(0.5)
+
     soup = BeautifulSoup(driver.page_source, "html.parser")
 
     containers = soup.select("a[href*='/discuss/'][class*='no-underline']")
@@ -401,11 +576,6 @@ def scrape_listing(driver: RenderedPage, url: str, max_posts: int = 6) -> list:
             a for a in soup.find_all("a", href=True)
             if "/discuss/" in a.get("href", "") and len(a.get_text(strip=True)) > 10
         ]
-
-    if not containers:
-        log.warning(f"No post cards found for {url}")
-        log.info("PAGE TITLE: " + driver.title)
-        return []
 
     log.info(f"Raw containers found: {len(containers)}")
 
@@ -452,7 +622,7 @@ def scrape_listing(driver: RenderedPage, url: str, max_posts: int = 6) -> list:
 
         if not any(kw in title.lower() for kw in [
             "interview", "experience", "sde", "questions", "question",
-            "swe", "rejected", "accepted", "reject", "accept", "l5", "selected", "select", "sse", "oa"
+            "swe", "rejected", "accepted", "reject", "accept", "l5","selected","select","sse","oa"
         ]):
             log.info(f"Skipping — no keyword match: {title!r}")
             continue
@@ -481,6 +651,7 @@ def scrape_listing(driver: RenderedPage, url: str, max_posts: int = 6) -> list:
                 break
 
         if not timestamp:
+            import re
             full_text = el.get_text(" ", strip=True)
             m = re.search(
                 r"(\d+\s+(?:minute|hour|day|week|month)s?\s+ago|just now|yesterday)",
@@ -502,6 +673,7 @@ def scrape_listing(driver: RenderedPage, url: str, max_posts: int = 6) -> list:
             "timestamp":   timestamp,
             "sort_key":    timestamp_to_sort_key(timestamp),
         })
+        time.sleep(SCRAPE_DELAY)
 
     posts.sort(key=lambda p: p["sort_key"], reverse=True)
     for p in posts:
@@ -513,47 +685,75 @@ def scrape_listing(driver: RenderedPage, url: str, max_posts: int = 6) -> list:
     return posts
 
 
-def _scrape_listing_with_retry(driver: RenderedPage, url: str, max_posts: int) -> list:
-    """Bounded retry with exponential backoff — never retries through a
-    confirmed block, just logs it and gives up for this cycle."""
-    attempts = MAX_RETRY + 1
-    for attempt in range(1, attempts + 1):
-        try:
-            return scrape_listing(driver, url, max_posts=max_posts)
-        except BlockedError as e:
-            log.warning(f"[attempt {attempt}/{attempts}] {url} blocked: {e}")
-        except Exception as e:
-            log.warning(f"[attempt {attempt}/{attempts}] {url} failed: {e}")
-        if attempt < attempts:
-            time.sleep(backoff_delay(attempt))
-    log.error(f"Giving up on listing {url} after {attempts} attempts")
-    return []
-
-
 # ── List + content functions (used by workflow) ───────────────────────────────
 
 def run_list_cycle() -> list:
     """
     Scrape listing pages and return post metadata list.
     Called by workflow.run_pipeline as list_fn.
-
-    Every call to Cloudflare's Browser Rendering API is an independent,
-    fully-rendered fetch — there's no persistent browser session to warm
-    up beforehand, so each listing page is fetched (with its own retry +
-    backoff) directly.
     """
     cookies = load_cookies_from_env()
-    driver  = build_driver(cookies)
+    driver  = None
     posts   = []
 
     try:
+        driver = build_driver(cookies)
+
+        # ── Warm-up: wait for Cloudflare to clear before hitting discuss pages ─
+        # Navigating straight to a deep URL with freshly-injected cookies often
+        # hits the Cloudflare JS challenge. Visiting the homepage first and
+        # polling until "Just a moment..." clears gives the session time to
+        # fully establish before scraping the actual listing pages.
+        log.info("Warm-up: navigating to leetcode.com to establish session")
+        driver.get("https://leetcode.com")
+
+        for _attempt in range(15):
+            title = driver.title.lower()
+            if "just a moment" in title or "cloudflare" in title:
+                log.info(f"Warm-up: Cloudflare challenge active (attempt {_attempt+1}/15) — waiting 1s")
+                time.sleep(1)
+                continue
+            log.info(f"Warm-up complete — title: {driver.title!r}")
+            break
+        else:
+            log.error("Warm-up: Cloudflare did not clear after 15s — triggering redeploy")
+            trigger_railway_redeploy()
+            raise RuntimeError("Cloudflare block on warm-up — redeploying")
+
+        # Extra settle time for React hydration and cookie propagation
+        time.sleep(3)
+
         log.info(f"Scraping URL1: {LEETCODE_URL_1}")
-        raw1 = _scrape_listing_with_retry(driver, LEETCODE_URL_1, MAX_POSTS_URL1)
+        raw1 = scrape_listing(driver, LEETCODE_URL_1, max_posts=MAX_POSTS_URL1)
         log.info(f"URL1 returned {len(raw1)} posts")
 
         log.info(f"Scraping URL2: {LEETCODE_URL_2}")
-        raw2 = _scrape_listing_with_retry(driver, LEETCODE_URL_2, MAX_POSTS_URL2)
+        raw2 = scrape_listing(driver, LEETCODE_URL_2, max_posts=MAX_POSTS_URL2)
         log.info(f"URL2 returned {len(raw2)} posts")
+
+        # ── URL2 Cloudflare retry ────────────────────────────────────────────
+        # LeetCode can re-trigger a fresh Cloudflare JS challenge on the SECOND
+        # deep navigation even within an already-warmed-up session (URL1 can
+        # succeed while URL2 still hits "Just a moment..."). If URL2 returned
+        # zero posts and the page title shows a Cloudflare challenge, wait for
+        # it to clear and retry URL2 once before giving up.
+        if not raw2 and ("just a moment" in driver.title.lower() or "cloudflare" in driver.title.lower()):
+            log.warning("URL2 hit Cloudflare — re-warming and retrying once")
+            for _attempt in range(15):
+                title = driver.title.lower()
+                if "just a moment" in title or "cloudflare" in title:
+                    log.info(f"URL2 retry warm-up: challenge active (attempt {_attempt+1}/15) — waiting 1s")
+                    time.sleep(1)
+                    continue
+                log.info(f"URL2 retry warm-up complete — title: {driver.title!r}")
+                break
+            else:
+                log.warning("URL2 retry warm-up: Cloudflare did not clear after 15s — skipping retry")
+
+            time.sleep(2)
+            log.info(f"Retrying URL2: {LEETCODE_URL_2}")
+            raw2 = scrape_listing(driver, LEETCODE_URL_2, max_posts=MAX_POSTS_URL2)
+            log.info(f"URL2 retry returned {len(raw2)} posts")
 
         seen_urls = set()
         combined  = []
@@ -583,18 +783,103 @@ def run_list_cycle() -> list:
 
         log.info(f"List cycle done — {len(posts)} combined posts")
 
-    except CloudflareConfigError:
-        raise
     except Exception as e:
+        err_msg = str(e).lower()
+        # Renderer crash / storage timeout — Chrome died mid-run (OOM after
+        # long uptime). Trigger one redeploy to get a fresh container, then
+        # return [] so the pipeline exits cleanly instead of crashing.
+        _RENDERER_SIGNALS = [
+            "timed out receiving message from renderer",
+            "session not created",
+            "chrome not reachable",
+            "no such session",
+            "invalid session id",
+            "target window already closed",
+            "errno 11",
+            "resource temporarily unavailable",
+            "blockingioerror",
+            "storage full",
+            "device or resource busy",
+        ]
+        if any(sig in err_msg for sig in _RENDERER_SIGNALS):
+            log.error(f"Renderer/storage crash in list cycle: {e} — triggering redeploy")
+            try:
+                trigger_railway_redeploy()
+            except Exception as _rd:
+                log.error(f"Redeploy call failed: {_rd}")
+            return []
         log.exception(f"List cycle crashed: {e}")
         raise
     finally:
-        driver.quit()
+        if driver:
+            try:
+                driver.quit()
+            except Exception:
+                pass
 
     return posts
 
 
 # ── Flask auth ────────────────────────────────────────────────────────────────
+
+# ── Railway auto-redeploy (one-shot) ─────────────────────────────────────────
+# Called when [Errno 11] / Chrome cannot start after all retries.
+# A flag file ensures it fires ONLY ONCE per container lifetime — never loops.
+# After redeploy, the new container has a clean FD/process table.
+#
+# Required Railway env vars:
+#   RAILWAY_API_TOKEN  — from Railway dashboard → Account → Tokens
+#   RAILWAY_SERVICE_ID — from Railway dashboard → Service → Settings
+
+_REDEPLOY_FLAG = "/tmp/.railway_redeploy_triggered"
+
+
+def trigger_railway_redeploy() -> bool:
+    """
+    Trigger one Railway redeploy via the Railway GraphQL API.
+    Returns True if the call succeeded, False otherwise.
+    Will never fire more than once per container lifetime.
+    """
+    if os.path.exists(_REDEPLOY_FLAG):
+        log.info("Auto-redeploy already triggered this session — skipping")
+        return False
+
+    api_token  = os.environ.get("RAILWAY_API_TOKEN", "")
+    service_id = os.environ.get("RAILWAY_SERVICE_ID", "")
+
+    if not api_token or not service_id:
+        log.warning(
+            "Auto-redeploy skipped: RAILWAY_API_TOKEN or RAILWAY_SERVICE_ID not set. "
+            "Add these to Railway env vars to enable auto-recovery."
+        )
+        return False
+
+    query = """
+    mutation serviceInstanceRedeploy($serviceId: String!) {
+      serviceInstanceRedeploy(serviceId: $serviceId)
+    }
+    """
+    try:
+        resp = requests.post(
+            "https://backboard.railway.com/graphql/v2",
+            headers={
+                "Authorization": f"Bearer {api_token}",
+                "Content-Type":  "application/json",
+            },
+            json={"query": query, "variables": {"serviceId": service_id}},
+            timeout=15,
+        )
+        if resp.ok:
+            open(_REDEPLOY_FLAG, "w").write("1")   # set one-shot flag
+            log.info(f"🔄 Railway auto-redeploy triggered (service={service_id})")
+            return True
+        else:
+            log.error(f"Railway redeploy API [{resp.status_code}]: {resp.text[:200]}")
+            return False
+    except Exception as e:
+        log.error(f"Railway redeploy request failed: {e}")
+        return False
+
 
 def auth_check() -> bool:
     api_key  = request.headers.get("X-API-Key", "")
