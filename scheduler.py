@@ -8,7 +8,7 @@ from __future__ import annotations
 import threading
 from apscheduler.schedulers.background import BackgroundScheduler
 
-from config import SCHEDULER_INTERVAL
+from config import SCHEDULER_INTERVAL, SCHEDULER_JITTER_SECONDS
 from logger import get_logger
 
 log = get_logger("scheduler")
@@ -43,10 +43,19 @@ def start_scheduler(pipeline_fn) -> BackgroundScheduler:
         func=lambda: _locked_run(pipeline_fn),
         trigger="interval",
         hours=SCHEDULER_INTERVAL,
+        jitter=SCHEDULER_JITTER_SECONDS,   # randomize run time so requests
+                                            # to the target site aren't
+                                            # perfectly periodic
         id="pipeline_cron",
         replace_existing=True,
         max_instances=1,
+        misfire_grace_time=300,            # tolerate a delayed trigger
+                                            # (e.g. brief container hiccup)
+                                            # instead of skipping the run
     )
     scheduler.start()
-    log.info(f"Scheduler started — runs every {SCHEDULER_INTERVAL} hours")
+    log.info(
+        f"Scheduler started — runs every {SCHEDULER_INTERVAL}h "
+        f"(±{SCHEDULER_JITTER_SECONDS}s jitter)"
+    )
     return scheduler
