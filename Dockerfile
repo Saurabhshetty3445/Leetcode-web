@@ -32,11 +32,20 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # ===============================
 # INSTALL SCRAPLING'S BROWSERS
-# Downloads the Chromium/Patchright build + fingerprint-manipulation deps that
-# StealthyFetcher/StealthySession need. Replaces the old manual Google Chrome +
+# Downloads the Chromium/Camoufox build + fingerprint-manipulation deps that
+# scrapling's fetchers need. Replaces the old manual Google Chrome +
 # matching-chromedriver install dance entirely.
+#
+# StealthyFetcher/StealthySession specifically run on Patchright (Scrapling's
+# stealth engine since v0.3.13), which manages its OWN Chromium build in a
+# separate revision from vanilla Playwright's — `scrapling install` alone can
+# leave that one missing ("Executable doesn't exist at .../chromium-XXXX"),
+# so install it explicitly too. `--force` on both guards against a cached
+# ".scrapling_dependencies_installed" marker short-circuiting the download on
+# rebuilds.
 # ===============================
-RUN scrapling install
+RUN scrapling install --force \
+    && python -m patchright install --with-deps chromium
 
 COPY . .
 
