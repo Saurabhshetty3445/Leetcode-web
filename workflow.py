@@ -26,14 +26,16 @@ log = get_logger("workflow")
 
 # ── Retry helpers ─────────────────────────────────────────────────────────────
 
-# Signals that mean the Chrome renderer/process is dead and must be rebuilt
+# Signals that mean the underlying browser session is dead and must be rebuilt.
+# Scrapling runs on Playwright under the hood, so these replace the old
+# Selenium/Chrome-specific error strings.
 _RENDERER_CRASH_SIGNALS = [
-    "timed out receiving message from renderer",
+    "target page, context or browser has been closed",
+    "browser has been closed",
+    "browser closed",
+    "connection closed",
     "session not created",
-    "chrome not reachable",
-    "no such session",
-    "invalid session id",
-    "target window already closed",
+    "executable doesn't exist",
     "errno 11",
     "resource temporarily unavailable",
     "blockingioerror",
@@ -263,7 +265,7 @@ def run_pipeline(list_fn, scrape_fn) -> dict:
         return summary
 
     # ── STEPS 3–7: per-post processing ───────────────────────────────────────
-    from scraper import build_driver, load_cookies_from_env  # avoid circular import
+    from scraper import build_driver, load_cookies_from_env, find_leetcode_problem_url  # avoid circular import
 
     cookies = load_cookies_from_env()
     driver  = None
