@@ -3,9 +3,18 @@ scraper.py — LeetCode Interview Experience Scraper
 Hosted on Railway | Self-scheduled every 4 hours via APScheduler
 Endpoints: /list, /scrape-content (legacy), /run (manual trigger), /health
 
-⚠️  Scraping logic (build_driver, scrape_post_detail, scrape_listing,
-    is_today_strict, timestamp_to_sort_key) is UNCHANGED from the original.
-    All pipeline orchestration lives in workflow.py.
+⚠️  Fetching engine: Scrapling's `StealthySession` (https://github.com/D4Vinci/Scrapling).
+    Selenium + manual Cloudflare warm-up polling + hand-rolled stealth JS have been
+    removed entirely — Scrapling's StealthyFetcher bypasses Cloudflare
+    Turnstile/Interstitial, fingerprints, and headless-detection out of the box via
+    `solve_cloudflare=True`. `ScraplingBrowser` below is a thin adapter that keeps the
+    same `driver.get(url)` / `driver.page_source` / `driver.quit()` surface the rest of
+    this codebase (workflow.py, links_workflow.py) already expects, so nothing outside
+    this file needed to change.
+
+    HTML parsing (BeautifulSoup selectors, keyword filters, date-extraction strategies,
+    is_today_strict, timestamp_to_sort_key) is UNCHANGED from the original — only the
+    fetch layer was swapped out.
 """
 
 import os
@@ -14,19 +23,15 @@ import time
 import hashlib
 import logging
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Callable
 import threading
 import uuid
 
 import requests
 from bs4 import BeautifulSoup
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.chrome.options import Options
-from selenium.common.exceptions import TimeoutException, NoSuchElementException
 from flask import Flask, jsonify, request
+
+from scrapling.fetchers import StealthySession
 
 from config import (
     LEETCODE_URL_1, LEETCODE_URL_2,
@@ -43,161 +48,103 @@ app = Flask(__name__)
 _run_lock = threading.Lock()
 
 
-# ── Selenium Driver (UNCHANGED) ───────────────────────────────────────────────
+# ── Scrapling-backed "driver" adapter ─────────────────────────────────────────
+#
+# The rest of this codebase (workflow.py, links_workflow.py) was written against
+# a Selenium-style object: build_driver(cookies) -> driver, then
+# driver.get(url) / driver.page_source / driver.title / driver.quit() repeatedly,
+# reusing the same browser across many scrapes in one pipeline run.
+#
+# ScraplingBrowser gives them that exact surface while actually running on
+# Scrapling's StealthySession under the hood, so workflow.py / links_workflow.py
+# did not need to change at all.
 
-def _kill_zombie_chrome() -> None:
+class ScraplingBrowser:
     """
-    Kill any leftover Chrome/chromedriver processes before spawning a new one.
-    Prevents [Errno 11] BlockingIOError caused by exhausted OS process/FD limits
-    when the scheduler spawns Chrome repeatedly across 4-hour cron cycles.
+    Thin adapter around scrapling.fetchers.StealthySession that mimics just
+    enough of the old Selenium WebDriver interface (.get, .page_source,
+    .title, .quit) for the rest of the pipeline to keep working unmodified.
     """
-    import subprocess as _sp
-    for proc_name in ("chrome", "chromedriver", "google-chrome"):
+
+    def __init__(self, cookies: Optional[list] = None):
+        self._cookies = cookies or None
+        self._session = StealthySession(
+            headless=True,
+            solve_cloudflare=True,     # bypasses Cloudflare Turnstile/Interstitial automatically
+            real_chrome=False,         # bundled Chromium is fine; set True if a real Chrome is installed
+            block_webrtc=True,
+            hide_canvas=True,
+            google_search=True,        # sets a Google referer — looks like organic traffic
+            network_idle=True,         # wait for LeetCode's React app to settle before parsing
+            timeout=60000,             # generous timeout: CF challenge solving needs room to run
+            cookies=self._cookies,
+        )
+        self._session.__enter__()
+        self.page = None   # last-fetched Scrapling Response, mirrors "current page"
+
+    def get(
+        self,
+        url: str,
+        wait_selector: Optional[str] = None,
+        wait_selector_state: str = "attached",
+        page_action: Optional[Callable] = None,
+    ):
+        """Navigate to `url`, wait for `wait_selector` (if given), and stash the response."""
+        self.page = self._session.fetch(
+            url,
+            wait_selector=wait_selector,
+            wait_selector_state=wait_selector_state,
+            page_action=page_action,
+        )
+        return self.page
+
+    @property
+    def page_source(self) -> bytes:
+        """Raw HTML of the last-fetched page — BeautifulSoup accepts bytes directly."""
+        if self.page is None:
+            return b""
+        return self.page.body
+
+    @property
+    def title(self) -> str:
+        if self.page is None:
+            return ""
         try:
-            _sp.run(
-                ["pkill", "-f", proc_name],
-                stdout=_sp.DEVNULL,
-                stderr=_sp.DEVNULL,
-                timeout=5,
-            )
+            t = self.page.css("title::text").get()
+            return t or ""
         except Exception:
-            pass
-    time.sleep(1)   # give OS time to reclaim FDs
+            return ""
 
-
-def build_driver(cookies: Optional[list] = None) -> webdriver.Chrome:
-    # Kill zombie Chrome processes first — prevents [Errno 11] FD exhaustion
-    _kill_zombie_chrome()
-
-    opts = Options()
-
-    # 🔥 STABILITY FLAGS (critical for container)
-    opts.add_argument("--headless=new")
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--disable-gpu")
-    opts.add_argument("--disable-extensions")
-    opts.add_argument("--disable-software-rasterizer")
-    opts.add_argument("--disable-background-networking")
-    opts.add_argument("--disable-blink-features=AutomationControlled")
-    opts.add_argument("--no-first-run")
-    opts.add_argument("--disable-default-apps")
-    opts.add_argument("--window-size=1920,1080")   # real desktop resolution, not a bot-like size
-    opts.add_argument("--single-process")   # 🔥 important for low RAM
-    opts.add_argument("--no-zygote")        # 🔥 prevents zygote holding extra FDs
-
-    # 🔥 OOM / FD PREVENTION
-    opts.add_argument("--memory-pressure-off")
-    opts.add_argument("--disable-renderer-backgrounding")
-    opts.add_argument("--disable-backgrounding-occluded-windows")
-    opts.add_argument("--disable-features=TranslateUI,BlinkGenPropertyTrees")
-    opts.add_argument("--renderer-process-limit=1")
-    # NOTE: removed --blink-settings=imagesEnabled=false — Cloudflare's
-    # Turnstile challenge checks if images actually load; disabling them
-    # is a strong bot signal that contributes to session invalidation.
-
-    # 🔥 FINGERPRINT HARDENING — these directly target Cloudflare's bot checks
-    opts.add_argument("--disable-blink-features=AutomationControlled")
-    opts.add_argument("--lang=en-US,en")
-    opts.add_argument("--disable-web-security")
-    opts.add_argument("--disable-features=IsolateOrigins,site-per-process")
-    opts.add_argument("--disable-site-isolation-trials")
-
-    opts.page_load_strategy = "eager"
-
-    # ✅ realistic, current Chrome user agent (matches a real recent Chrome release)
-    opts.add_argument(
-        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/126.0.0.0 Safari/537.36"
-    )
-
-    # ✅ disable automation detection
-    opts.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
-    opts.add_experimental_option("useAutomationExtension", False)
-    opts.add_experimental_option("prefs", {
-        "profile.default_content_setting_values.notifications": 2,
-        "credentials_enable_service": False,
-        "profile.password_manager_enabled": False,
-    })
-
-    # ✅ force binary path (from Docker)
-    opts.binary_location = "/usr/bin/google-chrome"
-
-    # 🔥 FORCE MANUAL DRIVER (NO Selenium Manager)
-    from selenium.webdriver.chrome.service import Service as ChromeService
-    service = ChromeService(executable_path="/usr/bin/chromedriver")
-
-    # ✅ NO fallback → fail fast if broken
-    driver = webdriver.Chrome(service=service, options=opts)
-
-    driver.set_page_load_timeout(25)
-
-    # ── Comprehensive anti-detection script ─────────────────────────────────
-    # Cloudflare/Turnstile checks dozens of navigator/window properties beyond
-    # just navigator.webdriver. This script patches the most commonly checked
-    # ones so the headless browser looks like a real Chrome desktop session.
-    stealth_js = """
-        // Hide webdriver flag
-        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-
-        // Fake a realistic plugins array (real Chrome has several)
-        Object.defineProperty(navigator, 'plugins', {
-            get: () => [1, 2, 3, 4, 5].map(() => ({ name: 'Chrome PDF Plugin' }))
-        });
-
-        // Fake realistic languages
-        Object.defineProperty(navigator, 'languages', {
-            get: () => ['en-US', 'en']
-        });
-
-        // window.chrome must exist (headless lacks it by default)
-        window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){} };
-
-        // Permissions API — headless reports 'denied' for notifications by default
-        const originalQuery = window.navigator.permissions.query;
-        window.navigator.permissions.query = (parameters) => (
-            parameters.name === 'notifications'
-                ? Promise.resolve({ state: Notification.permission })
-                : originalQuery(parameters)
-        );
-
-        // WebGL vendor/renderer — headless often exposes 'Google SwiftShader'
-        // which is a strong automated-browser signal
-        const getParameter = WebGLRenderingContext.prototype.getParameter;
-        WebGLRenderingContext.prototype.getParameter = function(parameter) {
-            if (parameter === 37445) return 'Intel Inc.';
-            if (parameter === 37446) return 'Intel Iris OpenGL Engine';
-            return getParameter.apply(this, arguments);
-        };
-
-        // Hardware concurrency — headless sometimes reports 1 or unusual values
-        Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
-
-        // Screen properties consistent with the real window size
-        Object.defineProperty(screen, 'availWidth', { get: () => 1920 });
-        Object.defineProperty(screen, 'availHeight', { get: () => 1040 });
-    """
-    driver.execute_cdp_cmd(
-        "Page.addScriptToEvaluateOnNewDocument",
-        {"source": stealth_js},
-    )
-
-    # 🍪 cookies — visit homepage first so domain is set before injecting
-    if cookies:
-        driver.get("https://leetcode.com")
-        time.sleep(1.5)   # let initial page settle before adding cookies
-        for ck in cookies:
+    def find_element_text(self) -> str:
+        """Best-effort plain-text fallback, replacing Selenium's `body` text grab."""
+        if self.page is None:
+            return ""
+        try:
+            return self.page.get_all_text(strip=True)
+        except Exception:
             try:
-                driver.add_cookie(ck)
-            except Exception as e:
-                log.warning(f"Cookie inject failed: {e}")
-        log.info(f"Injected {len(cookies)} cookies")
+                return BeautifulSoup(self.page_source, "html.parser").get_text(" ", strip=True)
+            except Exception:
+                return ""
 
-    return driver
+    def quit(self) -> None:
+        try:
+            self._session.__exit__(None, None, None)
+        except Exception as e:
+            log.warning(f"ScraplingBrowser.quit(): session close failed: {e}")
+
+
+def build_driver(cookies: Optional[list] = None) -> ScraplingBrowser:
+    """Build a Scrapling-backed browser session. Kept name/signature for compatibility."""
+    return ScraplingBrowser(cookies)
 
 
 def load_cookies_from_env() -> Optional[list]:
+    """
+    Reads LEETCODE_COOKIES from env — a JSON list of cookie dicts, e.g.:
+    [{"name": "csrftoken", "value": "...", "domain": ".leetcode.com", "path": "/"}, ...]
+    Scrapling accepts this same shape via StealthySession(cookies=...).
+    """
     raw = os.environ.get("LEETCODE_COOKIES", "")
     if not raw:
         return None
@@ -208,9 +155,10 @@ def load_cookies_from_env() -> Optional[list]:
         return None
 
 
-# ── Scraping Logic (UNCHANGED) ────────────────────────────────────────────────
+# ── Scraping logic — fetch layer now runs on Scrapling; extraction/filtering
+#    logic (BeautifulSoup selectors, keyword rules, date parsing) UNCHANGED ──
 
-def scrape_post_detail(driver: webdriver.Chrome, url: str) -> Optional[str]:
+def scrape_post_detail(driver: ScraplingBrowser, url: str) -> Optional[str]:
     """
     Scrape post content from LeetCode discuss post.
     Collects text from: p, ul, li, b, h1, h2, h3, h4, i tags
@@ -219,19 +167,14 @@ def scrape_post_detail(driver: webdriver.Chrome, url: str) -> Optional[str]:
     """
     import re as _re
     try:
-        driver.get(url)
-
-        for sel in ["div.break-words", "div[class*='break-words']", "h1", "body"]:
-            try:
-                WebDriverWait(driver, 12).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, sel))
-                )
-                log.info(f"Post page loaded: {sel}")
-                break
-            except TimeoutException:
-                continue
-
-        time.sleep(1.5)
+        # CSS supports comma-grouped selectors, so this waits for whichever of
+        # these shows up first — same fallback chain Selenium polled one by one.
+        driver.get(
+            url,
+            wait_selector="div.break-words, div[class*='break-words'], h1, body",
+            wait_selector_state="attached",
+        )
+        log.info("Post page loaded")
         soup = BeautifulSoup(driver.page_source, "html.parser")
 
         for tag in soup.select("nav, footer, header, script, style, aside"):
@@ -268,7 +211,7 @@ def scrape_post_detail(driver: webdriver.Chrome, url: str) -> Optional[str]:
 
         if not lines:
             log.warning("Using body text fallback")
-            body = driver.find_element(By.TAG_NAME, "body").text
+            body = driver.find_element_text()
             lines = [body[:3000]]
 
         full_text = "\n".join(lines)
@@ -285,14 +228,14 @@ def scrape_post_detail(driver: webdriver.Chrome, url: str) -> Optional[str]:
     except Exception as e:
         log.error(f"Detail scrape failed for {url}: {e}")
         try:
-            body = driver.find_element(By.TAG_NAME, "body").text
+            body = driver.find_element_text()
             return body[:6000].strip() if body else None
         except Exception:
             pass
         return None
 
 
-def scrape_post_detail_with_date(driver: webdriver.Chrome, url: str) -> tuple:
+def scrape_post_detail_with_date(driver: ScraplingBrowser, url: str) -> tuple:
     """
     Scrape post content AND the real posting date from a LeetCode discuss post.
 
@@ -315,29 +258,27 @@ def scrape_post_detail_with_date(driver: webdriver.Chrome, url: str) -> tuple:
     content   = None
     posted_on = None
 
-    try:
-        driver.get(url)
-
-        # ── Wait for main content ─────────────────────────────────────────────
-        for sel in ["div.break-words", "div[class*='break-words']", "h1", "body"]:
-            try:
-                WebDriverWait(driver, 12).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, sel))
-                )
-                break
-            except TimeoutException:
-                continue
-
-        # ── Wait explicitly for <time> element (React renders this late) ──────
+    def _wait_for_time_tag(page) -> None:
+        """
+        Playwright page_action: explicitly wait for React to render the
+        <time datetime="..."> element, since it often hydrates after the
+        main container is already attached. Non-fatal if it never shows.
+        """
         try:
-            WebDriverWait(driver, 8).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "time[datetime]"))
-            )
+            page.wait_for_selector("time[datetime]", timeout=8000, state="attached")
             log.info("scrape_post_detail_with_date: <time> element found")
-        except TimeoutException:
-            log.warning("scrape_post_detail_with_date: <time> not found within 8s — trying JS wait")
-            # Extra JS wait for React hydration
-            time.sleep(2)
+        except Exception:
+            log.warning("scrape_post_detail_with_date: <time> not found within 8s")
+
+    try:
+        # Single fetch: wait for the main container, running the <time>-tag
+        # wait as a page_action along the way (see ScraplingBrowser.get()).
+        driver.get(
+            url,
+            wait_selector="div.break-words, div[class*='break-words'], h1, body",
+            wait_selector_state="attached",
+            page_action=_wait_for_time_tag,
+        )
 
         # ── Parse fully-rendered page ─────────────────────────────────────────
         soup = BeautifulSoup(driver.page_source, "html.parser")
@@ -424,7 +365,7 @@ def scrape_post_detail_with_date(driver: webdriver.Chrome, url: str) -> tuple:
             extract_from(soup)
         if not lines:
             try:
-                body = driver.find_element(By.TAG_NAME, "body").text
+                body = driver.find_element_text()
                 lines = [body[:3000]]
             except Exception:
                 pass
@@ -522,42 +463,54 @@ def post_hash(url: str) -> str:
     return hashlib.md5(url.encode()).hexdigest()
 
 
-def scrape_listing(driver: webdriver.Chrome, url: str, max_posts: int = 6) -> list:
-    import re
-    driver.get(url)
+def _scroll_listing(page) -> None:
+    """Playwright page_action: nudge the listing to trigger any lazy-rendered cards."""
+    try:
+        for _ in range(3):
+            page.mouse.wheel(0, 400)
+            page.wait_for_timeout(500)
+    except Exception as e:
+        log.warning(f"scrape_listing: scroll action failed (non-fatal): {e}")
 
-    waited = False
-    for wait_sel in [
-        "div.flex.flex-col.gap-4",
-        "div[class*='topic-item']",
-        "a[href*='/discuss/']",
-        "div.overflow-hidden",
-    ]:
-        try:
-            WebDriverWait(driver, 8).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, wait_sel))
-            )
-            log.info(f"Page loaded — wait selector matched: {wait_sel}")
-            waited = True
-            break
-        except TimeoutException:
-            continue
+
+def scrape_listing(driver: ScraplingBrowser, url: str, max_posts: int = 6) -> list:
+    import re
+
+    waited = True
+    fetch_err_msg = ""
+    try:
+        # CSS's comma-grouped-selector syntax replaces the old one-by-one
+        # WebDriverWait polling loop — Scrapling waits for the first of these
+        # to attach, and solve_cloudflare=True already handled any CF challenge.
+        driver.get(
+            url,
+            wait_selector=(
+                "div.flex.flex-col.gap-4, div[class*='topic-item'], "
+                "a[href*='/discuss/'], div.overflow-hidden"
+            ),
+            wait_selector_state="attached",
+            page_action=_scroll_listing,
+        )
+        log.info("Page loaded — listing selector matched")
+    except Exception as e:
+        # On a wait_selector timeout, driver.page never gets reassigned, so
+        # don't trust driver.title/page_source here — they'd reflect a stale
+        # previous fetch (or nothing at all). Just log the raw error.
+        waited = False
+        fetch_err_msg = str(e).lower()
+        log.error(f"Timed out — no post cards found for {url}: {e}")
 
     if not waited:
-        log.error("Timed out — no post cards found after all wait selectors")
-        log.info("PAGE TITLE: " + driver.title)
-        log.info("PAGE SNIPPET: " + driver.page_source[:2000])
-        if "just a moment" in driver.title.lower() or "cloudflare" in driver.title.lower():
-            log.error("Cloudflare block in scrape_listing — triggering redeploy")
+        if "just a moment" in fetch_err_msg or "cloudflare" in fetch_err_msg or "timeout" in fetch_err_msg:
+            # solve_cloudflare=True normally handles this on its own; reaching
+            # here means the challenge genuinely won the round — bail and let
+            # the next scheduled run (fresh browser/session) try again.
+            log.error("Listing fetch failed/blocked — triggering redeploy")
             try:
                 trigger_railway_redeploy()
             except Exception as _rd_err:
                 log.error(f"Redeploy call failed: {_rd_err}")
         return []
-
-    for _ in range(3):
-        driver.execute_script("window.scrollBy(0, 400);")
-        time.sleep(0.5)
 
     soup = BeautifulSoup(driver.page_source, "html.parser")
 
@@ -685,6 +638,40 @@ def scrape_listing(driver: webdriver.Chrome, url: str, max_posts: int = 6) -> li
     return posts
 
 
+def find_leetcode_problem_url(driver: ScraplingBrowser, search_keyword: str) -> Optional[str]:
+    """
+    Search LeetCode's problem set for `search_keyword` and return the canonical
+    /problems/<slug>/ URL of the first match, or None if nothing was found.
+
+    Referenced by workflow.py STEP 8 (attaching a real LeetCode problem URL to
+    each extracted problem) — added here since it previously had no
+    implementation anywhere in the codebase.
+    """
+    import urllib.parse
+
+    query = urllib.parse.quote(search_keyword.strip())
+    search_url = f"https://leetcode.com/problemset/?search={query}"
+
+    try:
+        driver.get(
+            search_url,
+            wait_selector="a[href*='/problems/'], div[role='row']",
+            wait_selector_state="attached",
+        )
+        soup = BeautifulSoup(driver.page_source, "html.parser")
+        link = soup.select_one("a[href*='/problems/']")
+        if link and link.get("href"):
+            href = link["href"].split("/description")[0].rstrip("/") + "/"
+            url = f"https://leetcode.com{href}" if href.startswith("/") else href
+            log.info(f"find_leetcode_problem_url: {search_keyword!r} -> {url}")
+            return url
+        log.info(f"find_leetcode_problem_url: no match for {search_keyword!r}")
+        return None
+    except Exception as e:
+        log.warning(f"find_leetcode_problem_url failed for {search_keyword!r}: {e}")
+        return None
+
+
 # ── List + content functions (used by workflow) ───────────────────────────────
 
 def run_list_cycle() -> list:
@@ -699,30 +686,9 @@ def run_list_cycle() -> list:
     try:
         driver = build_driver(cookies)
 
-        # ── Warm-up: wait for Cloudflare to clear before hitting discuss pages ─
-        # Navigating straight to a deep URL with freshly-injected cookies often
-        # hits the Cloudflare JS challenge. Visiting the homepage first and
-        # polling until "Just a moment..." clears gives the session time to
-        # fully establish before scraping the actual listing pages.
-        log.info("Warm-up: navigating to leetcode.com to establish session")
-        driver.get("https://leetcode.com")
-
-        for _attempt in range(15):
-            title = driver.title.lower()
-            if "just a moment" in title or "cloudflare" in title:
-                log.info(f"Warm-up: Cloudflare challenge active (attempt {_attempt+1}/15) — waiting 1s")
-                time.sleep(1)
-                continue
-            log.info(f"Warm-up complete — title: {driver.title!r}")
-            break
-        else:
-            log.error("Warm-up: Cloudflare did not clear after 15s — triggering redeploy")
-            trigger_railway_redeploy()
-            raise RuntimeError("Cloudflare block on warm-up — redeploying")
-
-        # Extra settle time for React hydration and cookie propagation
-        time.sleep(3)
-
+        # No manual Cloudflare warm-up/polling needed anymore — StealthySession's
+        # solve_cloudflare=True handles the Turnstile/Interstitial challenge
+        # internally on every fetch, including the very first navigation.
         log.info(f"Scraping URL1: {LEETCODE_URL_1}")
         raw1 = scrape_listing(driver, LEETCODE_URL_1, max_posts=MAX_POSTS_URL1)
         log.info(f"URL1 returned {len(raw1)} posts")
@@ -731,25 +697,12 @@ def run_list_cycle() -> list:
         raw2 = scrape_listing(driver, LEETCODE_URL_2, max_posts=MAX_POSTS_URL2)
         log.info(f"URL2 returned {len(raw2)} posts")
 
-        # ── URL2 Cloudflare retry ────────────────────────────────────────────
-        # LeetCode can re-trigger a fresh Cloudflare JS challenge on the SECOND
-        # deep navigation even within an already-warmed-up session (URL1 can
-        # succeed while URL2 still hits "Just a moment..."). If URL2 returned
-        # zero posts and the page title shows a Cloudflare challenge, wait for
-        # it to clear and retry URL2 once before giving up.
-        if not raw2 and ("just a moment" in driver.title.lower() or "cloudflare" in driver.title.lower()):
-            log.warning("URL2 hit Cloudflare — re-warming and retrying once")
-            for _attempt in range(15):
-                title = driver.title.lower()
-                if "just a moment" in title or "cloudflare" in title:
-                    log.info(f"URL2 retry warm-up: challenge active (attempt {_attempt+1}/15) — waiting 1s")
-                    time.sleep(1)
-                    continue
-                log.info(f"URL2 retry warm-up complete — title: {driver.title!r}")
-                break
-            else:
-                log.warning("URL2 retry warm-up: Cloudflare did not clear after 15s — skipping retry")
-
+        # ── URL2 retry ────────────────────────────────────────────────────────
+        # Even with solve_cloudflare=True, a listing fetch can occasionally come
+        # back empty (transient block, slow hydration). One retry after a short
+        # pause is cheap insurance before giving up on this cycle.
+        if not raw2:
+            log.warning("URL2 returned 0 posts — retrying once")
             time.sleep(2)
             log.info(f"Retrying URL2: {LEETCODE_URL_2}")
             raw2 = scrape_listing(driver, LEETCODE_URL_2, max_posts=MAX_POSTS_URL2)
@@ -785,16 +738,17 @@ def run_list_cycle() -> list:
 
     except Exception as e:
         err_msg = str(e).lower()
-        # Renderer crash / storage timeout — Chrome died mid-run (OOM after
-        # long uptime). Trigger one redeploy to get a fresh container, then
-        # return [] so the pipeline exits cleanly instead of crashing.
+        # Browser/session crash or OS resource exhaustion mid-run. Trigger one
+        # redeploy to get a fresh container, then return [] so the pipeline
+        # exits cleanly instead of crashing. Signals updated for Scrapling's
+        # Playwright-based engine instead of Selenium/Chrome's error strings.
         _RENDERER_SIGNALS = [
-            "timed out receiving message from renderer",
+            "target page, context or browser has been closed",
+            "browser has been closed",
+            "browser closed",
+            "connection closed",
             "session not created",
-            "chrome not reachable",
-            "no such session",
-            "invalid session id",
-            "target window already closed",
+            "executable doesn't exist",
             "errno 11",
             "resource temporarily unavailable",
             "blockingioerror",
@@ -1081,10 +1035,8 @@ def _execute_date_filter_bg(run_id: str, date_str: str) -> None:
 
         try:
             driver = build_driver(cookies)
-
-            # Warm-up
-            driver.get("https://leetcode.com")
-            time.sleep(3)
+            # No warm-up navigation needed — StealthySession solves Cloudflare
+            # per-request via solve_cloudflare=True.
 
             for i, post_url in enumerate(unique_urls, 1):
                 log.info(f"[date-filter] Scraping [{i}/{len(unique_urls)}]: {post_url}")
