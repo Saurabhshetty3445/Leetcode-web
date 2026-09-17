@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 from typing import Optional, Callable
 import threading
 import uuid
+import multiprocessing as mp
 
 import requests
 from bs4 import BeautifulSoup
@@ -44,8 +45,23 @@ log = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# ── Lock for /run endpoint ────────────────────────────────────────────────────
+# ── Lock for pipeline runs — shared by BOTH the manual /run endpoint AND the
+#    scheduler (see run_pipeline_isolated() + __main__ below). Previously
+#    scraper.py and scheduler.py each had their OWN separate lock, so a
+#    manual /run trigger and a scheduled cron run could execute concurrently.
+#    Two Patchright/Playwright browser sessions racing inside the SAME shared
+#    Node.js driver subprocess is exactly what produces CDP protocol
+#    corruption ("Invalid InterceptionId") that hard-crashes the Node driver
+#    — and once that driver process dies, EVERY future browser call in this
+#    Python process fails forever (until the container restarts), which is
+#    why the scraper appeared to "stop working and do nothing". One shared
+#    lock makes that overlap impossible.
 _run_lock = threading.Lock()
+
+# Hard ceiling on how long a single pipeline run is allowed to take. If it
+# hangs (e.g. a stuck browser wait) past this, the run is force-killed rather
+# than holding the lock — and therefore blocking every future run — forever.
+PIPELINE_TIMEOUT_SECONDS = int(os.environ.get("PIPELINE_TIMEOUT_SECONDS", "2700"))  # 45 min
 
 
 # ── Scrapling-backed "driver" adapter ─────────────────────────────────────────
@@ -875,12 +891,16 @@ def list_endpoint():
     """Legacy endpoint — returns post list (no pipeline execution)."""
     if not auth_check():
         return jsonify({"error": "Unauthorized"}), 401
+    if not _run_lock.acquire(blocking=False):
+        return jsonify({"status": "busy", "message": "Main pipeline is using the browser — try again shortly", "posts": []}), 409
     try:
         posts  = run_list_cycle()
         result = {"status": "success", "count": len(posts), "posts": posts}
         return jsonify(result), 200
     except Exception as e:
         return jsonify({"status": "error", "message": str(e), "posts": []}), 500
+    finally:
+        _run_lock.release()
 
 
 @app.route("/scrape-content", methods=["POST"])
@@ -894,6 +914,9 @@ def content_endpoint():
 
     if not post_url:
         return jsonify({"error": "Missing post_url in request body"}), 400
+
+    if not _run_lock.acquire(blocking=False):
+        return jsonify({"status": "busy", "message": "Main pipeline is using the browser — try again shortly", "content": ""}), 409
 
     cookies = load_cookies_from_env()
     driver  = None
@@ -909,6 +932,7 @@ def content_endpoint():
     finally:
         if driver:
             driver.quit()
+        _run_lock.release()
 
 
 # ── Pipeline run state (in-memory, sufficient for single-process Railway) ─────
@@ -921,29 +945,79 @@ _pipeline_state: dict = {
 }
 
 
-def _execute_pipeline_bg(run_id: str) -> None:
-    """Background thread target — runs the full pipeline and updates state."""
-    global _pipeline_state
+def _pipeline_worker(result_queue: "mp.Queue", run_kind: str) -> None:
+    """
+    Runs the ENTIRE pipeline in its own OS process (see run_pipeline_isolated
+    below). Patchright's Node.js driver process can hard-crash on protocol
+    errors (e.g. "Invalid InterceptionId" from two browser sessions racing
+    each other) — an uncaught crash there is unrecoverable for the rest of
+    that Python process's lifetime. Running each pipeline execution in a
+    fresh child process means such a crash only takes down that one child;
+    the long-lived Flask/scheduler process is untouched, and the very next
+    run gets a completely clean Node driver.
+    """
     try:
+        if run_kind == "scheduled":
+            import supabase_client as db
+            db.cleanup_old_post_ids()
         from workflow import run_pipeline
-        summary = run_pipeline(
-            list_fn   = run_list_cycle,
-            scrape_fn = scrape_post_detail,
-        )
-        _pipeline_state.update({
-            "status":      "done",
-            "finished_at": datetime.now(timezone.utc).isoformat(),
-            "summary":     summary,
-        })
-        log.info(f"[run_id={run_id}] Pipeline finished: {summary}")
-    except Exception as e:
-        log.exception(f"[run_id={run_id}] Pipeline crashed: {e}")
-        _pipeline_state.update({
-            "status":      "error",
-            "finished_at": datetime.now(timezone.utc).isoformat(),
-            "summary":     {"error": str(e)},
-        })
+        summary = run_pipeline(list_fn=run_list_cycle, scrape_fn=scrape_post_detail)
+        result_queue.put(("done", summary))
+    except BaseException as e:
+        # BaseException on purpose — a dying Node driver can surface as
+        # unusual exceptions bubbling up through patchright's sync wrapper;
+        # we still want to report it rather than let the child vanish silently.
+        result_queue.put(("error", f"{type(e).__name__}: {e}"))
+
+
+def run_pipeline_isolated(run_kind: str, run_id: str) -> None:
+    """
+    Acquire _run_lock (caller must have already grabbed it — see below),
+    execute the pipeline in a fresh child process with a hard timeout, update
+    _pipeline_state, and ALWAYS release the lock + reap the child, whether
+    the run succeeds, raises, times out, or the child process dies outright.
+    """
+    global _pipeline_state
+    ctx = mp.get_context("spawn")   # spawn, not fork — never inherit a live Node driver
+    result_queue: "mp.Queue" = ctx.Queue()
+    proc = ctx.Process(target=_pipeline_worker, args=(result_queue, run_kind), daemon=True)
+    proc.start()
+
+    status, payload = None, None
+    deadline = time.time() + PIPELINE_TIMEOUT_SECONDS
+    try:
+        while time.time() < deadline:
+            if not result_queue.empty():
+                status, payload = result_queue.get()
+                break
+            if not proc.is_alive():
+                time.sleep(0.2)   # tiny grace period in case put() raced with exit
+                if not result_queue.empty():
+                    status, payload = result_queue.get()
+                else:
+                    status  = "crashed"
+                    payload = f"Pipeline process exited unexpectedly (exitcode={proc.exitcode})"
+                break
+            time.sleep(1)
+        else:
+            status  = "timeout"
+            payload = f"Pipeline exceeded {PIPELINE_TIMEOUT_SECONDS}s — force-killed"
+            log.error(payload)
     finally:
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(timeout=10)
+            if proc.is_alive():
+                proc.kill()
+                proc.join(timeout=5)
+        result_queue.close()
+
+        _pipeline_state.update({
+            "status":      "done" if status == "done" else "error",
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "summary":     payload,
+        })
+        log.info(f"[run_id={run_id}] Pipeline {status}: {payload}")
         _run_lock.release()
 
 
@@ -952,7 +1026,8 @@ def run_endpoint():
     """
     Manual pipeline trigger — fires async, returns immediately with run_id.
     Poll /run/status to check progress.
-    Prevents overlapping runs via lock.
+    Shares _run_lock with the scheduler (see __main__) so a manual trigger
+    and a scheduled cron run can never execute concurrently.
     """
     if not auth_check():
         return jsonify({"error": "Unauthorized"}), 401
@@ -974,7 +1049,7 @@ def run_endpoint():
         "summary":     None,
     })
 
-    t = threading.Thread(target=_execute_pipeline_bg, args=(run_id,), daemon=True)
+    t = threading.Thread(target=run_pipeline_isolated, args=("manual", run_id), daemon=True)
     t.start()
 
     log.info(f"[run_id={run_id}] Pipeline started in background")
@@ -1019,6 +1094,21 @@ _date_filter_state: dict = {
 def _execute_date_filter_bg(run_id: str, date_str: str) -> None:
     """Background thread — runs the date filter correction pipeline."""
     global _date_filter_state
+
+    # Guard against overlapping with the main /run pipeline or the scheduler —
+    # they'd otherwise launch a second, colliding browser session (see the
+    # big comment on _run_lock near the top of this file).
+    got_browser_slot = _run_lock.acquire(blocking=False)
+    if not got_browser_slot:
+        log.warning(f"[date-filter run_id={run_id}] Skipped — main pipeline is using the browser")
+        _date_filter_state.update({
+            "status":      "error",
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "summary":     {"error": "Main pipeline was running — try again shortly"},
+        })
+        _date_filter_lock.release()
+        return
+
     try:
         import supabase_client as _db
         from links_workflow import scrape_post_date
@@ -1105,6 +1195,7 @@ def _execute_date_filter_bg(run_id: str, date_str: str) -> None:
         })
     finally:
         _date_filter_lock.release()
+        _run_lock.release()
 
 
 @app.route("/date-filter/<path:date_str>", methods=["POST"])
@@ -1183,6 +1274,19 @@ _links_state: dict = {
 def _execute_links_bg(run_id: str) -> None:
     """Background thread — runs the links batch pipeline."""
     global _links_state
+
+    # Same cross-pipeline browser guard as date-filter — see _run_lock comment.
+    got_browser_slot = _run_lock.acquire(blocking=False)
+    if not got_browser_slot:
+        log.warning(f"[links run_id={run_id}] Skipped — main pipeline is using the browser")
+        _links_state.update({
+            "status":      "error",
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "summary":     {"error": "Main pipeline was running — try again shortly"},
+        })
+        _links_lock.release()
+        return
+
     try:
         from links_workflow import run_links_pipeline
         summary = run_links_pipeline(scrape_fn=scrape_post_detail)
@@ -1201,6 +1305,7 @@ def _execute_links_bg(run_id: str) -> None:
         })
     finally:
         _links_lock.release()
+        _run_lock.release()
 
 
 @app.route("/process-links", methods=["POST"])
@@ -1253,17 +1358,30 @@ def process_links_status_endpoint():
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    from workflow import run_pipeline
     from scheduler import start_scheduler
-    import supabase_client as db
 
     def scheduled_pipeline():
-        """Zero-arg wrapper used by the scheduler."""
-        db.cleanup_old_post_ids()
-        return run_pipeline(
-            list_fn   = run_list_cycle,
-            scrape_fn = scrape_post_detail,
-        )
+        """
+        Zero-arg wrapper used by the scheduler. Shares _run_lock with the
+        manual /run endpoint (see comment on _run_lock above) and runs
+        through the exact same isolated-subprocess path, so a scheduled run
+        and a manual run can never execute concurrently and a crashed
+        Node/browser driver can never take down the main process.
+        """
+        acquired = _run_lock.acquire(blocking=False)
+        if not acquired:
+            log.warning("Scheduled run skipped — a pipeline run is already in progress")
+            return
+
+        run_id = str(uuid.uuid4())[:8]
+        _pipeline_state.update({
+            "status":      "running",
+            "run_id":      run_id,
+            "started_at":  datetime.now(timezone.utc).isoformat(),
+            "finished_at": None,
+            "summary":     None,
+        })
+        run_pipeline_isolated("scheduled", run_id)   # releases _run_lock itself when done
 
     scheduler = start_scheduler(scheduled_pipeline)
 
