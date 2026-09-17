@@ -139,17 +139,44 @@ def build_driver(cookies: Optional[list] = None) -> ScraplingBrowser:
     return ScraplingBrowser(cookies)
 
 
+def _normalize_cookies_for_playwright(cookies: list) -> list:
+    """
+    Playwright/Patchright's BrowserContext.add_cookies() is strict: every
+    cookie dict MUST carry either a "url" or a "domain"+"path" pair, or the
+    whole call raises. Selenium's driver.add_cookie() had no such requirement
+    (it just used whatever domain the browser was currently on), so cookies
+    exported from a browser extension or Selenium-era env var often only have
+    {"name", "value"}. Backfill sane LeetCode defaults so those still work.
+    """
+    normalized = []
+    for ck in cookies:
+        if not isinstance(ck, dict) or "name" not in ck or "value" not in ck:
+            log.warning(f"Skipping malformed cookie (needs name+value): {ck!r}")
+            continue
+        ck = dict(ck)  # don't mutate the caller's list
+        if not ck.get("url") and not (ck.get("domain") and ck.get("path")):
+            ck.setdefault("domain", ".leetcode.com")
+            ck.setdefault("path", "/")
+        normalized.append(ck)
+    return normalized
+
+
 def load_cookies_from_env() -> Optional[list]:
     """
     Reads LEETCODE_COOKIES from env — a JSON list of cookie dicts, e.g.:
     [{"name": "csrftoken", "value": "...", "domain": ".leetcode.com", "path": "/"}, ...]
-    Scrapling accepts this same shape via StealthySession(cookies=...).
+    Bare {"name", "value"} pairs are also accepted — see
+    _normalize_cookies_for_playwright() for the domain/path backfill.
     """
     raw = os.environ.get("LEETCODE_COOKIES", "")
     if not raw:
         return None
     try:
-        return json.loads(raw)
+        cookies = json.loads(raw)
+        if not isinstance(cookies, list):
+            log.error("LEETCODE_COOKIES must be a JSON list of cookie dicts")
+            return None
+        return _normalize_cookies_for_playwright(cookies)
     except Exception as e:
         log.error(f"Failed to parse LEETCODE_COOKIES: {e}")
         return None
