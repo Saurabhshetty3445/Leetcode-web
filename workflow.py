@@ -13,7 +13,7 @@ from __future__ import annotations
 import time
 from typing import Optional
 
-from config import MAX_RETRY, SCRAPE_DELAY
+from config import MAX_RETRY, SCRAPE_DELAY, ENABLE_PROBLEM_URL_LOOKUP, MAX_PROBLEM_URL_LOOKUPS_PER_RUN
 from logger import get_logger
 from cleaner import clean_text
 from gemini_client import extract_problems
@@ -213,6 +213,7 @@ def run_pipeline(list_fn, scrape_fn) -> dict:
         "db_inserts":       0,
         "errors":           [],
     }
+    problem_url_lookups_used = 0   # run-level cap — see STEP 8 below
 
     # ── STEP 1: fetch listing ─────────────────────────────────────────────────
     log.info("══ STEP 1: Fetching post list ══")
@@ -341,15 +342,25 @@ def run_pipeline(list_fn, scrape_fn) -> dict:
                 summary["errors"].append(f"db_fail:{post_id}")
 
             # ── STEP 8: LeetCode problem URL lookup ───────────────────────────
-            if stored_ids:
+            # Each lookup is a full extra browser page-load — cap total lookups
+            # per run (ENABLE_PROBLEM_URL_LOOKUP / MAX_PROBLEM_URL_LOOKUPS_PER_RUN
+            # in config.py) so this can't uncappedly inflate compute cost.
+            if stored_ids and ENABLE_PROBLEM_URL_LOOKUP:
                 log.info(f"STEP 8 — Looking up LeetCode URLs for {len(stored_ids)} problem(s)")
                 for problem_id, cp_id, search_keyword in stored_ids:
+                    if problem_url_lookups_used >= MAX_PROBLEM_URL_LOOKUPS_PER_RUN:
+                        log.info(
+                            f"STEP 8 — Run cap reached ({MAX_PROBLEM_URL_LOOKUPS_PER_RUN} lookups) "
+                            f"— skipping remaining URL lookups this run"
+                        )
+                        break
                     if not search_keyword:
                         log.info(f"STEP 8 — No keyword for problem_id={problem_id}, skipping")
                         continue
                     log.info(f"STEP 8 — Searching LeetCode: '{search_keyword}'")
                     try:
                         problem_url = find_leetcode_problem_url(driver, search_keyword)
+                        problem_url_lookups_used += 1
                         if problem_url:
                             db.update_problem_url(problem_id, cp_id, problem_url)
                             summary["problem_urls_found"] += 1
@@ -359,6 +370,8 @@ def run_pipeline(list_fn, scrape_fn) -> dict:
                     except Exception as e:
                         log.error(f"STEP 8 — URL lookup failed for '{search_keyword}': {e}")
                     time.sleep(1)   # polite delay between searches
+            elif stored_ids and not ENABLE_PROBLEM_URL_LOOKUP:
+                log.info("STEP 8 — Skipped (ENABLE_PROBLEM_URL_LOOKUP=false)")
 
             time.sleep(SCRAPE_DELAY)
 
