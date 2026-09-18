@@ -29,3 +29,10 @@ SCHEDULER_INTERVAL  = 4      # cron hours between runs
 SCHEDULER_JITTER_SECONDS = int(os.environ.get("SCHEDULER_JITTER_SECONDS", "300"))
                               # randomize the scheduled run time by up to this many
                               # seconds so requests aren't perfectly periodic
+
+# ── STEP 8: LeetCode problem-URL lookup ───────────────────────────────────────
+# Each lookup is a full extra browser page-load (search LeetCode's problem set).
+# Uncapped, this scales linearly with however many NEW problems a run finds —
+# cap it so one unusually large run can't blow the day's compute budget.
+ENABLE_PROBLEM_URL_LOOKUP      = os.environ.get("ENABLE_PROBLEM_URL_LOOKUP", "true").lower() == "true"
+MAX_PROBLEM_URL_LOOKUPS_PER_RUN = int(os.environ.get("MAX_PROBLEM_URL_LOOKUPS_PER_RUN", "5"))
