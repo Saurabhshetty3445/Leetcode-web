@@ -1,3 +1,4 @@
+
 """
 scraper.py — LeetCode Interview Experience Scraper
 Hosted on Railway | Self-scheduled every 4 hours via APScheduler
@@ -90,10 +91,29 @@ class ScraplingBrowser:
             real_chrome=False,         # bundled Chromium is fine; set True if a real Chrome is installed
             block_webrtc=True,
             hide_canvas=True,
-            google_search=True,        # sets a Google referer — looks like organic traffic
-            network_idle=True,         # wait for LeetCode's React app to settle before parsing
+            google_search=True,        # sets a Google referer — looks like organic traffic (cheap: header only)
+            network_idle=False,        # see .get() — wait_selector already gates on real content;
+                                        # network_idle waits for ALL network activity (ads/analytics
+                                        # included) to go quiet, which was inflating every single
+                                        # fetch's wall-clock time (→ billed CPU/memory-seconds on Railway)
             timeout=60000,             # generous timeout: CF challenge solving needs room to run
             cookies=self._cookies,
+            # Cost-saving Chromium launch flags — the old Selenium build_driver()
+            # shipped a long list of these (--single-process, --no-zygote,
+            # --disable-gpu, etc.) to keep memory/CPU down on a small Railway
+            # instance; Patchright's defaults don't apply any of that on their
+            # own, so the browser was silently running "full fat" under Scrapling.
+            extra_flags=[
+                "--disable-gpu",
+                "--disable-extensions",
+                "--disable-software-rasterizer",
+                "--disable-background-networking",
+                "--disable-backgrounding-occluded-windows",
+                "--disable-renderer-backgrounding",
+                "--memory-pressure-off",
+                "--no-first-run",
+                "--mute-audio",
+            ],
         )
         self._session.__enter__()
         self.page = None   # last-fetched Scrapling Response, mirrors "current page"
@@ -104,13 +124,22 @@ class ScraplingBrowser:
         wait_selector: Optional[str] = None,
         wait_selector_state: str = "attached",
         page_action: Optional[Callable] = None,
+        **extra,
     ):
-        """Navigate to `url`, wait for `wait_selector` (if given), and stash the response."""
+        """
+        Navigate to `url`, wait for `wait_selector` (if given), and stash the
+        response. Extra StealthFetchParams (network_idle, solve_cloudflare,
+        timeout, wait, ...) can be passed per-call to override the session
+        default — used by cheap/best-effort calls like
+        find_leetcode_problem_url() that don't need the full CF-solving +
+        network-idle treatment every single time.
+        """
         self.page = self._session.fetch(
             url,
             wait_selector=wait_selector,
             wait_selector_state=wait_selector_state,
             page_action=page_action,
+            **extra,
         )
         return self.page
 
@@ -216,6 +245,7 @@ def scrape_post_detail(driver: ScraplingBrowser, url: str) -> Optional[str]:
             url,
             wait_selector="div.break-words, div[class*='break-words'], h1, body",
             wait_selector_state="attached",
+            wait=500,   # small fixed settle instead of the costlier network_idle wait
         )
         log.info("Post page loaded")
         soup = BeautifulSoup(driver.page_source, "html.parser")
@@ -321,6 +351,7 @@ def scrape_post_detail_with_date(driver: ScraplingBrowser, url: str) -> tuple:
             wait_selector="div.break-words, div[class*='break-words'], h1, body",
             wait_selector_state="attached",
             page_action=_wait_for_time_tag,
+            wait=300,   # small settle on top of the explicit <time>-tag wait above
         )
 
         # ── Parse fully-rendered page ─────────────────────────────────────────
@@ -700,6 +731,12 @@ def find_leetcode_problem_url(driver: ScraplingBrowser, search_keyword: str) -> 
             search_url,
             wait_selector="a[href*='/problems/'], div[role='row']",
             wait_selector_state="attached",
+            # Cheap/best-effort call: the session already solved Cloudflare on
+            # an earlier fetch this run, so don't pay for full re-detection —
+            # and cap wait time tighter since a miss here just means "no URL
+            # found", not a broken pipeline.
+            solve_cloudflare=False,
+            timeout=20000,
         )
         soup = BeautifulSoup(driver.page_source, "html.parser")
         link = soup.select_one("a[href*='/problems/']")
